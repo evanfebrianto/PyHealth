@@ -31,6 +31,7 @@ import itertools
 import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import zlib
 import platformdirs
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
 import polars as pl
+from litdata.processing.data_processor import in_notebook
 from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -333,40 +335,27 @@ def _sequential_visit_idx_for_time(
     return chosen
 
 
-def build_cehr_sequences(
+def _concept_vocab_key_for_cehr(res: Dict[str, Any]) -> str:
+    """Dense-vocabulary string for one resource (aligned with MPF CEHR tokens)."""
+
+    rt = res.get("resourceType")
+    ck = _clinical_concept_key(res)
+    if rt == "Observation":
+        ck = ck or "obs|unknown"
+    if ck is None:
+        ck = f"{(rt or 'res').lower()}|unknown"
+    return ck
+
+
+def collect_cehr_timeline_events(
     patient: FHIRPatient,
-    vocab: ConceptVocab,
-    max_len: int,
-    *,
-    base_time: Optional[datetime] = None,
-    grow_vocab: bool = True,
-) -> Tuple[
-    List[int],
-    List[int],
-    List[float],
-    List[float],
-    List[int],
-    List[int],
-]:
-    """Flatten patient resources into CEHR-aligned lists (pre-padding).
+) -> List[Tuple[datetime, Dict[str, Any], int]]:
+    """Clinical events in CEHR timeline order (time, resource, visit_idx).
 
-    Args:
-        max_len: Maximum number of **clinical** tokens emitted (after time sort and
-            tail slice). Use ``0`` to emit no clinical tokens (empty lists; avoids
-            Python's ``events[-0:]`` which would incorrectly take the full timeline).
-            Downstream MPF tasks reserve two slots for ``<mor>``/``<cls>`` and
-            ``<reg>``, so pass ``max_len - 2`` there when the final tensor length
-            is fixed.
-        grow_vocab: If True (default), assign new dense ids via ``add_token``. If
-            False, use only existing ids (``<unk>`` for unknown codes)—for parallel
-            ``set_task`` workers after a main-process vocabulary warmup.
+    Matches encounter grouping and visit indexing used by
+    :func:`build_cehr_sequences` / MPF so vocabulary warmup stays consistent
+    without materializing per-token feature lists.
     """
-
-    birth = patient.birth_date
-    if birth is None:
-        pr = patient.get_patient_resource()
-        if pr:
-            birth = _parse_dt(pr.get("birthDate"))
 
     events: List[Tuple[datetime, Dict[str, Any], int]] = []
     encounters = [r for r in patient.resources if r.get("resourceType") == "Encounter"]
@@ -436,6 +425,64 @@ def build_cehr_sequences(
         events.append((t, r, v_idx))
 
     events.sort(key=lambda x: x[0])
+    return events
+
+
+def warm_mpf_vocab_from_fhir_patient(
+    vocab: ConceptVocab,
+    patient: FHIRPatient,
+    clinical_cap: int,
+) -> None:
+    """Register concept keys for the tail clinical window (MPF parallel path).
+
+    Lighter than :func:`build_cehr_sequences`: no per-position feature lists.
+    """
+
+    tail = (
+        collect_cehr_timeline_events(patient)[-clinical_cap:]
+        if clinical_cap > 0
+        else []
+    )
+    for _, res, _ in tail:
+        vocab.add_token(_concept_vocab_key_for_cehr(res))
+
+
+def build_cehr_sequences(
+    patient: FHIRPatient,
+    vocab: ConceptVocab,
+    max_len: int,
+    *,
+    base_time: Optional[datetime] = None,
+    grow_vocab: bool = True,
+) -> Tuple[
+    List[int],
+    List[int],
+    List[float],
+    List[float],
+    List[int],
+    List[int],
+]:
+    """Flatten patient resources into CEHR-aligned lists (pre-padding).
+
+    Args:
+        max_len: Maximum number of **clinical** tokens emitted (after time sort and
+            tail slice). Use ``0`` to emit no clinical tokens (empty lists; avoids
+            Python's ``events[-0:]`` which would incorrectly take the full timeline).
+            Downstream MPF tasks reserve two slots for ``<mor>``/``<cls>`` and
+            ``<reg>``, so pass ``max_len - 2`` there when the final tensor length
+            is fixed.
+        grow_vocab: If True (default), assign new dense ids via ``add_token``. If
+            False, use only existing ids (``<unk>`` for unknown codes)—for parallel
+            ``set_task`` workers after a main-process vocabulary warmup.
+    """
+
+    birth = patient.birth_date
+    if birth is None:
+        pr = patient.get_patient_resource()
+        if pr:
+            birth = _parse_dt(pr.get("birthDate"))
+
+    events = collect_cehr_timeline_events(patient)
 
     if base_time is None and events:
         base_time = events[0][0]
@@ -455,11 +502,7 @@ def build_cehr_sequences(
     for t, res, v_idx in tail:
         t = _as_naive(t)
         rt = res.get("resourceType")
-        ck = _clinical_concept_key(res)
-        if rt == "Observation":
-            ck = ck or "obs|unknown"
-        if ck is None:
-            ck = f"{(rt or 'res').lower()}|unknown"
+        ck = _concept_vocab_key_for_cehr(res)
         if grow_vocab:
             cid = vocab.add_token(ck)
         else:
@@ -514,6 +557,70 @@ def infer_mortality_label(patient: FHIRPatient) -> int:
         if any(x in ck for x in ("death", "deceased", "mortality")):
             return 1
     return 0
+
+
+def synthetic_mpf_one_patient_resources() -> List[Dict[str, Any]]:
+    """Minimal FHIR NDJSON rows for one patient (tests, quick-start examples)."""
+
+    patient: Dict[str, Any] = {
+        "resourceType": "Patient",
+        "id": "p-synth-1",
+        "birthDate": "1950-01-01",
+        "gender": "female",
+    }
+    enc: Dict[str, Any] = {
+        "resourceType": "Encounter",
+        "id": "e1",
+        "subject": {"reference": "Patient/p-synth-1"},
+        "period": {"start": "2020-06-01T10:00:00Z"},
+        "class": {"code": "IMP"},
+    }
+    cond: Dict[str, Any] = {
+        "resourceType": "Condition",
+        "id": "c1",
+        "subject": {"reference": "Patient/p-synth-1"},
+        "encounter": {"reference": "Encounter/e1"},
+        "code": {
+            "coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "I10"}]
+        },
+        "onsetDateTime": "2020-06-01T11:00:00Z",
+    }
+    return [patient, enc, cond]
+
+
+def synthetic_mpf_two_patient_resources() -> List[Dict[str, Any]]:
+    """Two-patient fixture including a deceased patient (binary label smoke tests)."""
+
+    dead_p: Dict[str, Any] = {
+        "resourceType": "Patient",
+        "id": "p-synth-2",
+        "birthDate": "1940-05-05",
+        "deceasedBoolean": True,
+    }
+    dead_enc: Dict[str, Any] = {
+        "resourceType": "Encounter",
+        "id": "e-dead",
+        "subject": {"reference": "Patient/p-synth-2"},
+        "period": {"start": "2020-07-01T10:00:00Z"},
+        "class": {"code": "IMP"},
+    }
+    dead_obs: Dict[str, Any] = {
+        "resourceType": "Observation",
+        "id": "o-dead",
+        "subject": {"reference": "Patient/p-synth-2"},
+        "encounter": {"reference": "Encounter/e-dead"},
+        "effectiveDateTime": "2020-07-01T12:00:00Z",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "789-0"}]},
+    }
+    return [*synthetic_mpf_one_patient_resources(), dead_p, dead_enc, dead_obs]
+
+
+def synthetic_mpf_one_patient_ndjson_text() -> str:
+    return "\n".join(json.dumps(r) for r in synthetic_mpf_one_patient_resources()) + "\n"
+
+
+def synthetic_mpf_two_patient_ndjson_text() -> str:
+    return "\n".join(json.dumps(r) for r in synthetic_mpf_two_patient_resources()) + "\n"
 
 
 def read_fhir_settings_yaml(path: Optional[str] = None) -> Dict[str, Any]:
@@ -683,8 +790,12 @@ def stream_fhir_ndjson_root_to_sharded_parquet(
     if len(work_args) == 1:
         n_rows = _process_fhir_file_chunk(work_args[0])
     else:
+        # ``spawn`` matches :meth:`BaseDataset._task_transform` — avoid ``fork`` with
+        # a Polars-import-loaded parent (see Polars multiprocessing docs).
+        ctx = multiprocessing.get_context("spawn")
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers
+            max_workers=max_workers,
+            mp_context=ctx,
         ) as executor:
             counts = list(
                 tqdm(
@@ -914,10 +1025,21 @@ class MIMIC4FHIRDataset(BaseDataset):
         from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
 
         if isinstance(task, MPFClinicalPredictionTask):
-            self._warm_mpf_vocabulary(task)
+            nw = (
+                1
+                if in_notebook()
+                else (num_workers if num_workers is not None else self.num_workers)
+            )
+            pid_n = len(self.unique_patient_ids)
+            effective_workers = min(nw, pid_n) if pid_n else 1
+            ensure_special_tokens(self.vocab)
+            if effective_workers > 1:
+                self._warm_mpf_vocabulary(task)
+                task.frozen_vocab = True
+            else:
+                task.frozen_vocab = False
             task.vocab = self.vocab
             task._specials = ensure_special_tokens(self.vocab)
-            task.frozen_vocab = True
         return super().set_task(
             task,
             num_workers,
@@ -926,8 +1048,8 @@ class MIMIC4FHIRDataset(BaseDataset):
         )
 
     def _warm_mpf_vocabulary(self, task: Any) -> None:
-        # Match :meth:`MPFClinicalPredictionTask.__call__`: specials before clinical.
-        ensure_special_tokens(self.vocab)
+        """Main-process vocab keys only (parallel ``set_task`` workers use frozen vocab)."""
+
         clinical_cap = max(0, task.max_len - 2)
         # Same batching as :func:`_task_transform_fn` — one collect per batch, not
         # one full scan per patient.
@@ -943,7 +1065,7 @@ class MIMIC4FHIRDataset(BaseDataset):
                 patient_id = patient_key[0]
                 py_patient = Patient(patient_id=patient_id, data_source=patient_df)
                 fp = fhir_patient_from_patient(py_patient)
-                build_cehr_sequences(fp, self.vocab, clinical_cap, grow_vocab=True)
+                warm_mpf_vocab_from_fhir_patient(self.vocab, fp, clinical_cap)
 
     def gather_samples(self, task: Any) -> List[Dict[str, Any]]:
         """Run ``task`` on each :class:`~pyhealth.data.Patient` (tabular path)."""

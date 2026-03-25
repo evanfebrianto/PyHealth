@@ -49,9 +49,11 @@ class MPFClinicalPredictionTask(BaseTask):
     Works on :class:`~pyhealth.data.Patient` (standard ``global_event_df`` /
     :meth:`~pyhealth.datasets.MIMIC4FHIRDataset.set_task` path) or legacy
     :class:`~pyhealth.datasets.mimic4_fhir.FHIRPatient`. For :meth:`set_task`,
-    :class:`~pyhealth.datasets.MIMIC4FHIRDataset` warms the vocabulary in the main
-    process then sets :attr:`frozen_vocab` so worker processes do not grow the
-    vocab.
+    :class:`~pyhealth.datasets.MIMIC4FHIRDataset` reserves specials, then either
+    warms concept keys in the main process and sets :attr:`frozen_vocab` when
+    multiple workers run :meth:`~pyhealth.datasets.BaseDataset._task_transform`, or
+    leaves :attr:`frozen_vocab` false for a single-worker transform so the vocab
+    grows in one pass.
 
     Attributes:
         max_len: Truncated sequence length (must be >= 2 for boundary tokens).

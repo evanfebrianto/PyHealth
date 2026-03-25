@@ -192,7 +192,8 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
             )
             task = MPFClinicalPredictionTask(max_len=48, use_mpf=True)
             ds_a.set_task(task, num_workers=1)
-            self.assertTrue(task.frozen_vocab)
+            # Single-process transform: vocab grows during caching; no pre-warm pass.
+            self.assertFalse(task.frozen_vocab)
 
             ref = sorted(
                 ds_b.gather_samples(MPFClinicalPredictionTask(max_len=48, use_mpf=True)),
@@ -207,6 +208,22 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
                 if hasattr(bc, "tolist"):
                     bc = bc.tolist()
                 self.assertEqual(ac, bc)
+
+    def test_set_task_multi_worker_sets_frozen_vocab(self) -> None:
+        """``effective_workers > 1`` requires main-process warmup and frozen ids."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp))
+            from pyhealth.tasks.mpf_clinical_prediction import (
+                MPFClinicalPredictionTask,
+            )
+
+            ds = MIMIC4FHIRDataset(
+                root=tmp, glob_pattern="*.ndjson", cache_dir=tmp, num_workers=2
+            )
+            task = MPFClinicalPredictionTask(max_len=48, use_mpf=True)
+            ds.set_task(task, num_workers=2)
+            self.assertTrue(task.frozen_vocab)
 
     def test_encounter_reference_requires_exact_id(self) -> None:
         """``e1`` must not match reference ``Encounter/e10`` (substring bug)."""
