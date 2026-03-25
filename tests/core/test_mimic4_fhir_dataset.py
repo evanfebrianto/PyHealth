@@ -3,15 +3,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import polars as pl
+
 from pyhealth.datasets import MIMIC4FHIRDataset
 from pyhealth.datasets.mimic4_fhir import (
     ConceptVocab,
+    FHIR_RESOURCE_JSON_COL,
+    FHIR_EVENT_TYPE,
     build_cehr_sequences,
-    build_fhir_sample_dataset_from_lines,
-    group_resources_by_patient,
+    fhir_patient_from_patient,
     infer_mortality_label,
-    synthetic_ndjson_lines,
-    synthetic_ndjson_lines_two_class,
+)
+
+from tests.core.mimic4_fhir_ndjson_fixtures import (
+    ndjson_two_class_text,
+    write_one_patient_ndjson,
+    write_two_class_ndjson,
 )
 
 
@@ -28,54 +35,55 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
         v = ConceptVocab.from_json({"token_to_id": {}, "next_id": 50})
         self.assertEqual(v._next_id, 50)
 
-    def test_group_resources(self) -> None:
-        lines = synthetic_ndjson_lines()
-        resources = []
-        for line in lines:
-            import json
+    def test_disk_fixture_resolves_events_per_patient(self) -> None:
+        """NDJSON on disk → Parquet cache carries multiple rows for ``p-synth-1``."""
 
-            resources.append(json.loads(line))
-        g = group_resources_by_patient(resources)
-        self.assertIn("p-synth-1", g)
-        self.assertGreaterEqual(len(g["p-synth-1"]), 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            tdir = Path(tmp)
+            write_one_patient_ndjson(tdir)
+            ds = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            sub = (
+                ds.global_event_df.filter(pl.col("patient_id") == "p-synth-1")
+                .collect(engine="streaming")
+            )
+            self.assertGreaterEqual(len(sub), 2)
 
     def test_build_cehr_non_empty(self) -> None:
         from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
 
-        lines = synthetic_ndjson_lines()
-        _, vocab, _ = build_fhir_sample_dataset_from_lines(
-            lines,
-            MPFClinicalPredictionTask(max_len=64, use_mpf=True),
-        )
-        self.assertIsInstance(vocab, ConceptVocab)
-        self.assertGreater(vocab.vocab_size, 2)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_one_patient_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            task = MPFClinicalPredictionTask(max_len=64, use_mpf=True)
+            ds.gather_samples(task)
+            self.assertIsInstance(ds.vocab, ConceptVocab)
+            self.assertGreater(ds.vocab.vocab_size, 2)
 
     def test_mortality_heuristic(self) -> None:
-        lines = synthetic_ndjson_lines_two_class()
         from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
 
-        task = MPFClinicalPredictionTask(max_len=64, use_mpf=False)
-        _, _, samples = build_fhir_sample_dataset_from_lines(lines, task)
-        labels = {s["label"] for s in samples}
-        self.assertEqual(labels, {0, 1})
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            task = MPFClinicalPredictionTask(max_len=64, use_mpf=False)
+            samples = ds.gather_samples(task)
+            labels = {s["label"] for s in samples}
+            self.assertEqual(labels, {0, 1})
 
     def test_infer_deceased(self) -> None:
-        from pyhealth.datasets.mimic4_fhir import FHIRPatient, parse_ndjson_line
-
-        lines = synthetic_ndjson_lines_two_class()
-        resources = [parse_ndjson_line(x) for x in lines if parse_ndjson_line(x)]
-        g = group_resources_by_patient(resources)
-        dead = FHIRPatient(patient_id="p-synth-2", resources=g["p-synth-2"])
-        self.assertEqual(infer_mortality_label(dead), 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            dead = fhir_patient_from_patient(ds.get_patient("p-synth-2"))
+            self.assertEqual(infer_mortality_label(dead), 1)
 
     def test_disk_ndjson_gz_physionet_style(self) -> None:
         """Gzip NDJSON (PhysioNet ``*.ndjson.gz``) matches default glob when set."""
 
-        lines = synthetic_ndjson_lines_two_class()
         with tempfile.TemporaryDirectory() as tmp:
             gz_path = Path(tmp) / "fixture.ndjson.gz"
             with gzip.open(gz_path, "wt", encoding="utf-8") as gz:
-                gz.write("\n".join(lines) + "\n")
+                gz.write(ndjson_two_class_text())
             ds = MIMIC4FHIRDataset(
                 root=tmp, glob_pattern="*.ndjson.gz", max_patients=5
             )
@@ -84,10 +92,8 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
     def test_disk_ndjson_temp_dir(self) -> None:
         """Load from a temp directory (cleanup via context manager)."""
 
-        lines = synthetic_ndjson_lines_two_class()
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "fixture.ndjson"
-            path.write_text("\n".join(lines), encoding="utf-8")
+            write_two_class_ndjson(Path(tmp))
             ds = MIMIC4FHIRDataset(
                 root=tmp, glob_pattern="*.ndjson", max_patients=5
             )
@@ -103,11 +109,70 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
                 self.assertIn("concept_ids", s)
                 self.assertIn("label", s)
 
-    def test_global_event_df_not_supported(self) -> None:
+    def test_sharded_ingest_sorted_patient_ids_multi_part_cache(self) -> None:
+        """Hash shards → ``part-*.parquet``; patient ids exposed in sorted order."""
+
         with tempfile.TemporaryDirectory() as tmp:
-            ds = MIMIC4FHIRDataset(root=tmp, max_patients=2)
-            with self.assertRaises(NotImplementedError):
-                _ = ds.global_event_df
+            write_two_class_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(
+                root=tmp,
+                glob_pattern="*.ndjson",
+                cache_dir=tmp,
+                ingest_num_shards=8,
+            )
+            ids = ds.unique_patient_ids
+            self.assertEqual(ids, sorted(ids))
+            self.assertEqual(set(ids), {"p-synth-1", "p-synth-2"})
+            part_dir = ds.cache_dir / "global_event_df.parquet"
+            parts = sorted(part_dir.glob("part-*.parquet"))
+            self.assertGreaterEqual(len(parts), 1)
+            # ``p-synth-1`` / ``p-synth-2`` crc32 to different slots for 8 shards.
+            self.assertGreaterEqual(len(parts), 2)
+
+    def test_global_event_df_schema_and_streaming_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(
+                root=tmp,
+                glob_pattern="*.ndjson",
+                cache_dir=tmp,
+                max_patients=5,
+            )
+            lf = ds.global_event_df
+            df = lf.collect(engine="streaming")
+            self.assertGreater(len(df), 0)
+            self.assertIn("patient_id", df.columns)
+            self.assertIn("timestamp", df.columns)
+            self.assertIn("event_type", df.columns)
+            self.assertIn(FHIR_RESOURCE_JSON_COL, df.columns)
+            self.assertTrue((df["event_type"] == FHIR_EVENT_TYPE).all())
+
+    def test_set_task_parity_with_gather_samples_ndjson(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp), name="fx.ndjson")
+            from pyhealth.tasks.mpf_clinical_prediction import (
+                MPFClinicalPredictionTask,
+            )
+
+            ds = MIMIC4FHIRDataset(
+                root=tmp, glob_pattern="*.ndjson", cache_dir=tmp, num_workers=1
+            )
+            task = MPFClinicalPredictionTask(max_len=48, use_mpf=True)
+            ref = sorted(ds.gather_samples(task), key=lambda s: s["patient_id"])
+            task2 = MPFClinicalPredictionTask(max_len=48, use_mpf=True)
+            sample_ds = ds.set_task(task2, num_workers=1)
+            got = sorted(
+                [sample_ds[i] for i in range(len(sample_ds))],
+                key=lambda s: s["patient_id"],
+            )
+            self.assertEqual(len(got), len(ref))
+            for a, b in zip(ref, got):
+                self.assertEqual(a["label"], int(b["label"]))
+                ac = a["concept_ids"]
+                bc = b["concept_ids"]
+                if hasattr(bc, "tolist"):
+                    bc = bc.tolist()
+                self.assertEqual(ac, bc)
 
     def test_encounter_reference_requires_exact_id(self) -> None:
         """``e1`` must not match reference ``Encounter/e10`` (substring bug)."""
@@ -195,12 +260,10 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
         self.assertEqual(concept_ids.count(z00), 1)
 
     def test_cehr_sequence_shapes(self) -> None:
-        lines = synthetic_ndjson_lines()
-        from pyhealth.datasets.mimic4_fhir import FHIRPatient, parse_ndjson_line
-
-        resources = [parse_ndjson_line(x) for x in lines if parse_ndjson_line(x)]
-        g = group_resources_by_patient(resources)
-        p = FHIRPatient(patient_id="p-synth-1", resources=g["p-synth-1"])
+        with tempfile.TemporaryDirectory() as tmp:
+            write_one_patient_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            p = fhir_patient_from_patient(ds.get_patient("p-synth-1"))
         v = ConceptVocab()
         c, tt, ts, ag, vo, vs = build_cehr_sequences(p, v, max_len=32)
         n = len(c)

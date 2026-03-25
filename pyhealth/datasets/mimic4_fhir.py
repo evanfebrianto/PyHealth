@@ -4,27 +4,52 @@ Loads newline-delimited JSON (plain ``*.ndjson`` or gzip ``*.ndjson.gz``, as on
 PhysioNet), or Bundle ``entry`` resources, groups by Patient id, and builds
 token timelines for MPF / EHRMambaCEHR.
 
+:class:`MIMIC4FHIRDataset` materializes a PyHealth-standard **global event
+table** as Parquet (``patient_id``, ``timestamp``, ``event_type``,
+``fhir/resource_json``) under the dataset cache. Ingest **hash-partitions** rows
+by ``patient_id`` into multiple shard files (bounded memory, no full-table sort);
+``global_event_df`` may scan several ``part-*.parquet`` files like other
+multi-part caches. Per-patient time order still comes from
+:class:`~pyhealth.data.Patient` (``data_source.sort("timestamp")``). The same
+``global_event_df`` / :class:`~pyhealth.data.Patient` / :meth:`set_task` path
+as CSV-backed datasets applies downstream.
+
 Settings such as ``glob_pattern`` live in ``configs/mimic4_fhir.yaml`` and are
-read by :func:`read_fhir_settings_yaml`. For disk data, point
-:class:`MIMIC4FHIRDataset` at your PhysioNet export (``MIMIC4_FHIR_ROOT``); for
-tests, use :func:`synthetic_ndjson_lines` / :func:`synthetic_ndjson_lines_two_class`
-or a temporary ``*.ndjson`` file tree.
+read by :func:`read_fhir_settings_yaml`. For PhysioNet MIMIC-IV on FHIR, set
+``root`` to the ``fhir/`` directory that contains ``Mimic*.ndjson.gz`` shards
+(e.g. ``MimicPatient.ndjson.gz``, ``MimicEncounter.ndjson.gz``); the default
+``glob_pattern`` is ``**/*.ndjson.gz``. For tests, write small
+``*.ndjson`` / ``*.ndjson.gz`` files and point ``root`` / ``glob_pattern`` at them.
 """
 
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import logging
 import os
+import zlib
+import platformdirs
+import shutil
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
+import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 from yaml import safe_load
 
+from ..data import Patient
 from .base_dataset import BaseDataset
+
+# Normalized event table (BaseDataset / Patient contract)
+FHIR_EVENT_TYPE: str = "fhir"
+FHIR_RESOURCE_JSON_COL: str = "fhir/resource_json"
+FHIR_SCHEMA_VERSION: int = 1
 
 logger = logging.getLogger(__name__)
 
@@ -204,25 +229,43 @@ def _ref_id(ref: Optional[str]) -> Optional[str]:
     return ref
 
 
-def group_resources_by_patient(
-    resources: Sequence[Dict[str, Any]],
-) -> Dict[str, List[Dict[str, Any]]]:
-    by_patient: Dict[str, List[Dict[str, Any]]] = {}
-    for raw in resources:
-        r = raw.get("resource") if "resource" in raw else raw
-        if not isinstance(r, dict):
-            continue
-        rid: Optional[str] = None
-        rt = r.get("resourceType")
-        if rt == "Patient":
-            rid = r.get("id")
-        elif rt == "Encounter":
-            rid = _ref_id((r.get("subject") or {}).get("reference"))
-        elif rt in ("Condition", "Observation", "MedicationRequest", "Procedure"):
-            rid = _ref_id((r.get("subject") or {}).get("reference"))
-        if rid:
-            by_patient.setdefault(rid, []).append(r)
-    return by_patient
+def _unwrap_resource_dict(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    r = raw.get("resource") if "resource" in raw else raw
+    return r if isinstance(r, dict) else None
+
+
+def iter_resources_from_ndjson_obj(obj: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Yield FHIR resource dicts from one parsed NDJSON object.
+
+    Expands ``Bundle`` ``entry`` resources; otherwise yields a single resource.
+    """
+
+    if isinstance(obj, dict) and "entry" in obj:
+        for ent in obj.get("entry") or []:
+            res = ent.get("resource")
+            if isinstance(res, dict):
+                yield res
+    else:
+        r = _unwrap_resource_dict(obj)
+        if r is not None:
+            yield r
+
+
+def patient_id_for_resource(res: Dict[str, Any]) -> Optional[str]:
+    """Logical patient id for sharding and tabular ``patient_id`` (FHIR subject refs)."""
+
+    rid: Optional[str] = None
+    rt = res.get("resourceType")
+    if rt == "Patient":
+        pid = res.get("id")
+        rid = str(pid) if pid is not None else None
+    elif rt == "Encounter":
+        rid = _ref_id((res.get("subject") or {}).get("reference"))
+    elif rt in ("Condition", "Observation", "MedicationRequest", "Procedure"):
+        rid = _ref_id((res.get("subject") or {}).get("reference"))
+    return rid
 
 
 RESOURCE_TYPE_TO_TOKEN_TYPE = {
@@ -246,6 +289,17 @@ def _event_time(res: Dict[str, Any]) -> Optional[datetime]:
         return _parse_dt(res.get("authoredOn"))
     if rt == "Procedure":
         return _parse_dt(res.get("performedDateTime") or res.get("recordedDate"))
+    return None
+
+
+def resource_row_timestamp(res: Dict[str, Any]) -> Optional[datetime]:
+    """Timestamp for ``Patient.data_source`` sort order and Parquet ``timestamp``."""
+
+    t = _event_time(res)
+    if t is not None:
+        return t
+    if res.get("resourceType") == "Patient":
+        return _parse_dt(res.get("birthDate"))
     return None
 
 
@@ -281,6 +335,7 @@ def build_cehr_sequences(
     max_len: int,
     *,
     base_time: Optional[datetime] = None,
+    grow_vocab: bool = True,
 ) -> Tuple[
     List[int],
     List[int],
@@ -298,6 +353,9 @@ def build_cehr_sequences(
             Downstream MPF tasks reserve two slots for ``<mor>``/``<cls>`` and
             ``<reg>``, so pass ``max_len - 2`` there when the final tensor length
             is fixed.
+        grow_vocab: If True (default), assign new dense ids via ``add_token``. If
+            False, use only existing ids (``<unk>`` for unknown codes)—for parallel
+            ``set_task`` workers after a main-process vocabulary warmup.
     """
 
     birth = patient.birth_date
@@ -398,7 +456,10 @@ def build_cehr_sequences(
             ck = ck or "obs|unknown"
         if ck is None:
             ck = f"{(rt or 'res').lower()}|unknown"
-        cid = vocab.add_token(ck)
+        if grow_vocab:
+            cid = vocab.add_token(ck)
+        else:
+            cid = vocab[ck]
         tt = RESOURCE_TYPE_TO_TOKEN_TYPE.get(rt, 0)
         ts = float((t - base_time).total_seconds()) if base_time and t else 0.0
         age_y = 0.0
@@ -413,6 +474,25 @@ def build_cehr_sequences(
         visit_segments.append(seg)
 
     return concept_ids, token_types, time_stamps, ages, visit_orders, visit_segments
+
+
+def fhir_patient_from_patient(patient: Patient) -> FHIRPatient:
+    """Rebuild :class:`FHIRPatient` from a tabular :class:`~pyhealth.data.Patient`."""
+
+    resources: List[Dict[str, Any]] = []
+    for row in patient.data_source.iter_rows(named=True):
+        raw = row.get(FHIR_RESOURCE_JSON_COL)
+        if not raw:
+            continue
+        resources.append(json.loads(raw))
+    birth: Optional[datetime] = None
+    for r in resources:
+        if r.get("resourceType") == "Patient":
+            birth = _parse_dt(r.get("birthDate"))
+            break
+    return FHIRPatient(
+        patient_id=patient.patient_id, resources=resources, birth_date=birth
+    )
 
 
 def infer_mortality_label(patient: FHIRPatient) -> int:
@@ -448,76 +528,138 @@ def read_fhir_settings_yaml(path: Optional[str] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def collect_resources_from_root(root: Path, glob_pattern: str) -> List[Dict[str, Any]]:
-    """Read all NDJSON / NDJSON.GZ / Bundle lines under root matching ``glob_pattern``.
+def _fhir_event_dict(patient_id: str, res: Dict[str, Any]) -> Dict[str, Any]:
+    """One normalized event row (Python types) for Arrow/Polars."""
 
-    .. note::
+    return {
+        "patient_id": patient_id,
+        "event_type": FHIR_EVENT_TYPE,
+        "timestamp": resource_row_timestamp(res),
+        FHIR_RESOURCE_JSON_COL: json.dumps(
+            res, ensure_ascii=False, separators=(",", ":")
+        ),
+    }
 
-        **Memory:** Every matching file is read fully and all resource dicts are
-        kept in one list before patient grouping. A full PhysioNet MIMIC-IV FHIR
-        tree (dozens of multi-GB ``*.ndjson.gz`` files) can require **tens to
-        hundreds of GB RAM** and long wall time. For local development, pass a
-        narrower ``glob_pattern`` (e.g. a small subset of resource types) until
-        a streaming loader exists.
+
+def fhir_events_arrow_schema() -> pa.Schema:
+    """Arrow schema for normalized FHIR event rows."""
+
+    return pa.schema(
+        [
+            ("patient_id", pa.string()),
+            ("event_type", pa.string()),
+            ("timestamp", pa.timestamp("ms")),
+            (FHIR_RESOURCE_JSON_COL, pa.string()),
+        ]
+    )
+
+
+def _crc32_shard_index(key: str, num_shards: int) -> int:
+    """Stable shard index in ``[0, num_shards)`` (portable ``crc32``)."""
+
+    u = zlib.crc32(key.encode("utf-8")) & 0xFFFFFFFF
+    return int(u % max(1, num_shards))
+
+
+def stream_fhir_ndjson_root_to_sharded_parquet(
+    root: Path,
+    glob_pattern: str,
+    out_dir: Path,
+    *,
+    num_shards: int = 16,
+    batch_size: int = 50_000,
+) -> int:
+    """Stream matching NDJSON / NDJSON.GZ files into hash-sharded Parquet files.
+
+    All rows for a given ``patient_id`` share one shard. Shards with no rows get
+    no file. If nothing matches, writes a single empty ``shard-0000.parquet``.
+
+    Returns:
+        Number of rows written (FHIR resources with a resolvable ``patient_id``).
     """
 
-    all_res: List[Dict[str, Any]] = []
+    schema = fhir_events_arrow_schema()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    num_shards = max(1, int(num_shards))
+    batches: List[List[Dict[str, Any]]] = [[] for _ in range(num_shards)]
+    writers: List[Optional[pq.ParquetWriter]] = [None] * num_shards
+    n_rows = 0
+
+    def flush(shard: int) -> None:
+        nonlocal n_rows
+        if not batches[shard]:
+            return
+        table = pa.Table.from_pylist(batches[shard], schema=schema)
+        if writers[shard] is None:
+            writers[shard] = pq.ParquetWriter(
+                str(out_dir / f"shard-{shard:04d}.parquet"),
+                schema,
+            )
+        writers[shard].write_table(table)
+        n_rows += len(batches[shard])
+        batches[shard].clear()
+
     for fp in sorted(root.glob(glob_pattern)):
         if not fp.is_file():
             continue
         for obj in iter_ndjson_file(fp):
-            if isinstance(obj, dict) and "entry" in obj:
-                for ent in obj.get("entry") or []:
-                    res = ent.get("resource")
-                    if isinstance(res, dict):
-                        all_res.append(res)
-            else:
-                all_res.append(obj)
-    return all_res
+            if not isinstance(obj, dict):
+                continue
+            for res in iter_resources_from_ndjson_obj(obj):
+                pid = patient_id_for_resource(res)
+                if not pid:
+                    continue
+                s = _crc32_shard_index(pid, num_shards)
+                batches[s].append(_fhir_event_dict(pid, res))
+                if len(batches[s]) >= batch_size:
+                    flush(s)
+
+    for s in range(num_shards):
+        flush(s)
+    for s in range(num_shards):
+        if writers[s] is not None:
+            writers[s].close()
+
+    if n_rows == 0:
+        pq.write_table(
+            pa.Table.from_pylist([], schema=schema),
+            str(out_dir / "shard-0000.parquet"),
+        )
+    return n_rows
 
 
 class MIMIC4FHIRDataset(BaseDataset):
-    """MIMIC-IV on FHIR (NDJSON / Bundle) for CEHR token timelines.
+    """MIMIC-IV on FHIR (NDJSON / NDJSON.GZ / Bundle) with PyHealth's tabular cache.
 
-    Mirrors the *root + YAML config + task* workflow of
-    :class:`~pyhealth.datasets.MIMIC4Dataset`, but parses FHIR R4 resources instead
-    of MIMIC CSV tables. This class does **not** materialize a Parquet
-    ``global_event_df``; use :meth:`gather_samples` or :meth:`set_task` with
-    :class:`~pyhealth.tasks.mpf_clinical_prediction.MPFClinicalPredictionTask`.
+    Streams resources to ``global_event_df`` Parquet
+    (``patient_id``, ``timestamp``, ``event_type``, ``fhir/resource_json``), then
+    uses :class:`~pyhealth.data.Patient` and standard :meth:`set_task` like other
+    datasets. MPF uses :class:`~pyhealth.tasks.mpf_clinical_prediction.MPFClinicalPredictionTask`.
 
-    Configuration defaults live in ``pyhealth/datasets/configs/mimic4_fhir.yaml``
-    (``glob_pattern``, ``version``).
+    Configuration defaults live in ``pyhealth/datasets/configs/mimic4_fhir.yaml``.
 
     Args:
-        root: Directory tree containing NDJSON files.
+        root: Root directory scanned for NDJSON/NDJSON.GZ (PhysioNet: the ``fhir/``
+            folder with ``Mimic*.ndjson.gz`` files).
         config_path: Optional path to the FHIR YAML settings file.
-        glob_pattern: If set, overrides the YAML ``glob_pattern``.
-        max_patients: Stop after this many patients (sorted by id).
+        glob_pattern: If set, overrides the YAML ``glob_pattern`` (default
+            ``**/*.ndjson.gz`` for credentialled exports).
+        max_patients: After streaming, keep only the first N patient ids (sorted).
+        ingest_num_shards: Number of hash shards for the NDJSON→Parquet pass;
+            defaults from YAML ``ingest_num_shards`` or CPU-based heuristics.
         vocab_path: Optional path to a saved :class:`ConceptVocab` JSON.
         cache_dir: Forwarded to :class:`~pyhealth.datasets.BaseDataset`.
         num_workers: Forwarded to :class:`~pyhealth.datasets.BaseDataset`.
-        dev: If True and ``max_patients`` is None, caps loading at 1000 patients.
+        dev: If True and ``max_patients`` is None, caps at 1000 patients.
 
     Example:
         >>> from pyhealth.datasets import MIMIC4FHIRDataset
         >>> from pyhealth.tasks.mpf_clinical_prediction import (
         ...     MPFClinicalPredictionTask,
         ... )
-        >>> ds = MIMIC4FHIRDataset(root="/path/to/ndjson", max_patients=50)
+        >>> ds = MIMIC4FHIRDataset(root="/path/to/fhir", max_patients=50)
         >>> task = MPFClinicalPredictionTask(max_len=256)
         >>> sample_ds = ds.set_task(task)  # doctest: +SKIP
-
-    Raises:
-        FileNotFoundError: If ``root`` is not a directory when loading patients.
-
-    Note:
-        **Scalability:** :func:`collect_resources_from_root` loads **all**
-        resources from **every** file matched by ``glob_pattern`` into memory,
-        then groups by patient. This matches rubric-friendly synthetic tests but
-        is not appropriate for an entire credentialled FHIR export without a
-        restricted glob or future streaming/chunked ingest. Plan RAM and I/O
-        accordingly; ``max_patients`` only trims **after** the full resource list
-        is built.
     """
 
     def __init__(
@@ -526,11 +668,38 @@ class MIMIC4FHIRDataset(BaseDataset):
         config_path: Optional[str] = None,
         glob_pattern: Optional[str] = None,
         max_patients: Optional[int] = None,
+        ingest_num_shards: Optional[int] = None,
         vocab_path: Optional[str] = None,
         cache_dir: Optional[str | Path] = None,
         num_workers: int = 1,
         dev: bool = False,
     ) -> None:
+        default_cfg = os.path.join(
+            os.path.dirname(__file__), "configs", "mimic4_fhir.yaml"
+        )
+        self._fhir_config_path = str(Path(config_path or default_cfg).resolve())
+        self._fhir_settings = read_fhir_settings_yaml(self._fhir_config_path)
+        self.glob_pattern = (
+            glob_pattern
+            if glob_pattern is not None
+            else str(self._fhir_settings.get("glob_pattern", "**/*.ndjson.gz"))
+        )
+        mp = max_patients
+        if dev and mp is None:
+            mp = 1000
+        self.max_patients = mp
+        if ingest_num_shards is not None:
+            self.ingest_num_shards = max(1, int(ingest_num_shards))
+        else:
+            raw_shards = self._fhir_settings.get("ingest_num_shards")
+            if raw_shards is not None:
+                self.ingest_num_shards = max(1, int(raw_shards))
+            else:
+                self.ingest_num_shards = max(4, min(32, (os.cpu_count() or 4) * 2))
+        if vocab_path and os.path.isfile(vocab_path):
+            self.vocab = ConceptVocab.load(vocab_path)
+        else:
+            self.vocab = ConceptVocab()
         super().__init__(
             root=root,
             tables=["fhir_ndjson"],
@@ -540,200 +709,160 @@ class MIMIC4FHIRDataset(BaseDataset):
             num_workers=num_workers,
             dev=dev,
         )
-        cfg_path = config_path or os.path.join(
-            os.path.dirname(__file__), "configs", "mimic4_fhir.yaml"
+
+    def _init_cache_dir(self, cache_dir: str | Path | None) -> Path:
+        try:
+            y_digest = hashlib.sha256(
+                Path(self._fhir_config_path).read_bytes()
+            ).hexdigest()[:16]
+        except OSError:
+            y_digest = "missing"
+        id_str = json.dumps(
+            {
+                "root": str(self.root),
+                "tables": sorted(self.tables),
+                "dataset_name": self.dataset_name,
+                "dev": self.dev,
+                "glob_pattern": self.glob_pattern,
+                "max_patients": self.max_patients,
+                "ingest_num_shards": self.ingest_num_shards,
+                "fhir_schema_version": FHIR_SCHEMA_VERSION,
+                "fhir_yaml_digest16": y_digest,
+            },
+            sort_keys=True,
         )
-        self._fhir_settings = read_fhir_settings_yaml(cfg_path)
-        self.glob_pattern = (
-            glob_pattern
-            if glob_pattern is not None
-            else str(self._fhir_settings.get("glob_pattern", "**/*.ndjson"))
-        )
-        self.max_patients = max_patients
-        if self.dev and self.max_patients is None:
-            self.max_patients = 1000
-        if vocab_path and os.path.isfile(vocab_path):
-            self.vocab = ConceptVocab.load(vocab_path)
+        cid = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_str))
+        if cache_dir is None:
+            out = Path(platformdirs.user_cache_dir(appname="pyhealth")) / cid
+            out.mkdir(parents=True, exist_ok=True)
+            logger.info("No cache_dir provided. Using default cache dir: %s", out)
         else:
-            self.vocab = ConceptVocab()
-        self._patients: Optional[List[FHIRPatient]] = None
+            out = Path(cache_dir) / cid
+            out.mkdir(parents=True, exist_ok=True)
+            logger.info("Using provided cache_dir: %s", out)
+        return out
+
+    def _event_transform(self, output_dir: Path) -> None:
+        root = Path(self.root).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"MIMIC4 FHIR root not found: {root}")
+        try:
+            staging = self.create_tmpdir() / "fhir_event_shards"
+            staging.mkdir(parents=True, exist_ok=True)
+            stream_fhir_ndjson_root_to_sharded_parquet(
+                root,
+                self.glob_pattern,
+                staging,
+                num_shards=self.ingest_num_shards,
+                batch_size=50_000,
+            )
+            staged_files = sorted(staging.glob("shard-*.parquet"))
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            keep: Optional[Set[str]] = None
+            if self.max_patients is not None:
+                lf_all = pl.concat(
+                    [pl.scan_parquet(str(p)) for p in staged_files]
+                )
+                pids = (
+                    lf_all.select("patient_id")
+                    .unique()
+                    .sort("patient_id")
+                    .collect(engine="streaming")["patient_id"]
+                    .to_list()
+                )
+                keep = set(pids[: self.max_patients])
+
+            if keep is None:
+                for i, p in enumerate(staged_files):
+                    shutil.move(str(p), str(output_dir / f"part-{i:05d}.parquet"))
+            else:
+                for i, p in enumerate(staged_files):
+                    pl.scan_parquet(str(p)).filter(
+                        pl.col("patient_id").is_in(keep)
+                    ).sink_parquet(str(output_dir / f"part-{i:05d}.parquet"))
+        except Exception as e:
+            if output_dir.exists():
+                logger.error(
+                    "Error during FHIR event caching, removing incomplete dir %s",
+                    output_dir,
+                )
+                shutil.rmtree(output_dir)
+            raise e
+        finally:
+            self.clean_tmpdir()
 
     @property
-    def global_event_df(self) -> Any:
-        raise NotImplementedError(
-            "MIMIC4FHIRDataset does not build global_event_df. "
-            "Use gather_samples(task) or set_task(task) with "
-            "MPFClinicalPredictionTask."
-        )
+    def unique_patient_ids(self) -> List[str]:
+        """Sorted unique patient ids (stable across multi-part Parquet caches)."""
 
-    @property
-    def unique_patient_ids(self) -> List[str]:  # type: ignore[override]
-        return [p.patient_id for p in self.load_patients()]
+        if self._unique_patient_ids is None:
+            self._unique_patient_ids = (
+                self.global_event_df.select("patient_id")
+                .unique()
+                .sort("patient_id")
+                .collect(engine="streaming")["patient_id"]
+                .to_list()
+            )
+            logger.info("Found %d unique patient IDs", len(self._unique_patient_ids))
+        return self._unique_patient_ids
 
-    def get_patient(self, patient_id: str) -> Any:
-        raise NotImplementedError(
-            "MIMIC4FHIRDataset does not map to pyhealth.data.Patient; "
-            "use load_patients() and FHIRPatient."
-        )
-
-    def iter_patients(self, df: Optional[Any] = None) -> Iterator[Any]:
-        raise NotImplementedError(
-            "Use load_patients(); FHIR path does not stream Polars Patient rows."
-        )
+    def iter_patients(self, df: Optional[pl.LazyFrame] = None) -> Iterator[Patient]:
+        if df is not None:
+            yield from super().iter_patients(df)
+            return
+        base = self.global_event_df
+        for patient_id in self.unique_patient_ids:
+            patient_df = base.filter(pl.col("patient_id") == patient_id).collect(
+                engine="streaming"
+            )
+            yield Patient(patient_id=patient_id, data_source=patient_df)
 
     def stats(self) -> None:
-        n = len(self.load_patients())
-        print(f"Dataset: {self.dataset_name}")
-        print(f"Dev mode: {self.dev}")
-        print(f"FHIR patients: {n}")
+        super().stats()
 
     def set_task(
         self,
         task: Any = None,
-        num_workers: Optional[int] = None,  # unused; FHIR path is in-process
+        num_workers: Optional[int] = None,
         input_processors: Optional[Any] = None,
         output_processors: Optional[Any] = None,
     ) -> Any:
-        """Build a :class:`~pyhealth.datasets.SampleDataset` from FHIR + task."""
         self._main_guard(self.set_task.__name__)
         if task is None:
             raise ValueError(
                 "Pass a task instance, e.g. MPFClinicalPredictionTask(max_len=512)."
             )
-        from .sample_dataset import create_sample_dataset
+        from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
 
-        samples = self.gather_samples(task)
-        return create_sample_dataset(
-            samples=samples,
-            input_schema=task.input_schema,
-            output_schema=task.output_schema,
-            dataset_name=self.dataset_name,
-            task_name=task.task_name,
-            input_processors=input_processors,
-            output_processors=output_processors,
+        if isinstance(task, MPFClinicalPredictionTask):
+            self._warm_mpf_vocabulary(task)
+            task.vocab = self.vocab
+            task._specials = ensure_special_tokens(self.vocab)
+            task.frozen_vocab = True
+        return super().set_task(
+            task,
+            num_workers,
+            input_processors,
+            output_processors,
         )
 
-    def load_patients(self) -> List[FHIRPatient]:
-        if self._patients is not None:
-            return self._patients
-        root = Path(self.root).expanduser().resolve()
-        if not root.is_dir():
-            raise FileNotFoundError(f"MIMIC4 FHIR root not found: {root}")
-        all_res = collect_resources_from_root(root, self.glob_pattern)
-        grouped = group_resources_by_patient(all_res)
-        patients: List[FHIRPatient] = []
-        for pid, res_list in sorted(grouped.items()):
-            pr = FHIRPatient(patient_id=pid, resources=res_list)
-            for r in res_list:
-                if r.get("resourceType") == "Patient":
-                    pr.birth_date = _parse_dt(r.get("birthDate"))
-                    break
-            patients.append(pr)
-            if self.max_patients is not None and len(patients) >= self.max_patients:
-                break
-        self._patients = patients
-        logger.info("Loaded %d FHIR patients from %s", len(patients), root)
-        return patients
+    def _warm_mpf_vocabulary(self, task: Any) -> None:
+        # Match :meth:`MPFClinicalPredictionTask.__call__`: specials before clinical.
+        ensure_special_tokens(self.vocab)
+        clinical_cap = max(0, task.max_len - 2)
+        for py_patient in self.iter_patients():
+            fp = fhir_patient_from_patient(py_patient)
+            build_cehr_sequences(fp, self.vocab, clinical_cap, grow_vocab=True)
 
     def gather_samples(self, task: Any) -> List[Dict[str, Any]]:
-        """Run ``task`` on each :class:`FHIRPatient` (sets ``task.vocab``)."""
+        """Run ``task`` on each :class:`~pyhealth.data.Patient` (tabular path)."""
 
         task.vocab = self.vocab
         task._specials = None
-        patients = self.load_patients()
         samples: List[Dict[str, Any]] = []
-        for p in patients:
+        for p in self.iter_patients():
             samples.extend(task(p))
         return samples
-
-
-def synthetic_ndjson_lines() -> List[str]:
-    """Minimal synthetic FHIR lines for unit tests (no PHI)."""
-
-    patient = {
-        "resourceType": "Patient",
-        "id": "p-synth-1",
-        "birthDate": "1950-01-01",
-        "gender": "female",
-    }
-    enc = {
-        "resourceType": "Encounter",
-        "id": "e1",
-        "subject": {"reference": "Patient/p-synth-1"},
-        "period": {"start": "2020-06-01T10:00:00Z"},
-        "class": {"code": "IMP"},
-    }
-    cond = {
-        "resourceType": "Condition",
-        "id": "c1",
-        "subject": {"reference": "Patient/p-synth-1"},
-        "encounter": {"reference": "Encounter/e1"},
-        "code": {
-            "coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "I10"}]
-        },
-        "onsetDateTime": "2020-06-01T11:00:00Z",
-    }
-    return [json.dumps(patient), json.dumps(enc), json.dumps(cond)]
-
-
-def synthetic_ndjson_lines_two_class() -> List[str]:
-    """Two patients (alive + deceased) so binary label fit succeeds."""
-
-    base = synthetic_ndjson_lines()
-    dead_p = {
-        "resourceType": "Patient",
-        "id": "p-synth-2",
-        "birthDate": "1940-05-05",
-        "deceasedBoolean": True,
-    }
-    dead_enc = {
-        "resourceType": "Encounter",
-        "id": "e-dead",
-        "subject": {"reference": "Patient/p-synth-2"},
-        "period": {"start": "2020-07-01T10:00:00Z"},
-        "class": {"code": "IMP"},
-    }
-    dead_obs = {
-        "resourceType": "Observation",
-        "id": "o-dead",
-        "subject": {"reference": "Patient/p-synth-2"},
-        "encounter": {"reference": "Encounter/e-dead"},
-        "effectiveDateTime": "2020-07-01T12:00:00Z",
-        "code": {"coding": [{"system": "http://loinc.org", "code": "789-0"}]},
-    }
-    return base + [json.dumps(dead_p), json.dumps(dead_enc), json.dumps(dead_obs)]
-
-
-def build_fhir_sample_dataset_from_lines(
-    lines: Sequence[str],
-    task: Any,
-    *,
-    vocab_path: Optional[str] = None,
-) -> Tuple[List[FHIRPatient], ConceptVocab, List[Dict[str, Any]]]:
-    """Parse in-memory NDJSON lines into patients and task samples (for tests)."""
-
-    resources: List[Dict[str, Any]] = []
-    for line in lines:
-        o = parse_ndjson_line(line)
-        if o:
-            resources.append(o)
-    grouped = group_resources_by_patient(resources)
-    vocab = (
-        ConceptVocab.load(vocab_path)
-        if vocab_path and os.path.isfile(vocab_path)
-        else ConceptVocab()
-    )
-    patients: List[FHIRPatient] = []
-    for pid, res_list in grouped.items():
-        pr = FHIRPatient(patient_id=pid, resources=res_list)
-        for r in res_list:
-            if r.get("resourceType") == "Patient":
-                pr.birth_date = _parse_dt(r.get("birthDate"))
-                break
-        patients.append(pr)
-    task.vocab = vocab
-    task._specials = None
-    samples: List[Dict[str, Any]] = []
-    for p in patients:
-        samples.extend(task(p))
-    return patients, vocab, samples

@@ -26,11 +26,11 @@ real FHIR.
     needed for conclusive comparisons. Paste your table from ``--ablation``
     into the PR description.
 
-**Known limitation (full FHIR tree):** :class:`~pyhealth.datasets.MIMIC4FHIRDataset`
-loads **every** resource from **every** file matching ``glob_pattern`` into
-memory before grouping by patient. A complete PhysioNet export is **not** expected
-to fit comfortably on a laptop without a **restricted** ``glob_pattern`` (subset
-of ``*.ndjson.gz`` files) or future streaming ingest. See dataset API docs.
+**Scaling:** :class:`~pyhealth.datasets.MIMIC4FHIRDataset` streams NDJSON to
+hash-sharded Parquet (bounded RAM during ingest). Training still materializes
+per-patient timelines from Parquet when building batches; very large cohorts need
+enough RAM/disk for caches and batching. Restrict ``glob_pattern`` or
+``max_patients`` when prototyping on a laptop.
 
 **Approximate minimum specs** (``--quick-test``, CPU, synthetic 2-patient
 fixture; measured once on macOS/arm64 with ``/usr/bin/time -l``): peak RSS
@@ -49,8 +49,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
 import time
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 _parser = argparse.ArgumentParser(description="EHRMambaCEHR on MIMIC-IV FHIR (MPF)")
 _parser.add_argument(
@@ -71,8 +73,7 @@ _parser.add_argument(
     default=None,
     help=(
         "Override glob for NDJSON/NDJSON.GZ (default: yaml **/*.ndjson.gz). "
-        "Use a narrow pattern (e.g. MimicPatient*.ndjson.gz) to limit RAM—the "
-        "loader reads every matching file fully before grouping patients."
+        "Use a narrow pattern to limit ingest time and cache size."
     ),
 )
 _parser.add_argument(
@@ -118,7 +119,7 @@ _parser.add_argument(
     "--max-patients",
     type=int,
     default=500,
-    help="Max grouped patients after full parse (disk FHIR only); lower to save RAM.",
+    help="Cap patients after cache build (sorted ids); lower for smaller runs.",
 )
 _pre_args, _ = _parser.parse_known_args()
 if _pre_args.gpu is not None:
@@ -128,11 +129,9 @@ import torch
 
 from pyhealth.datasets import (
     MIMIC4FHIRDataset,
-    build_fhir_sample_dataset_from_lines,
     create_sample_dataset,
     get_dataloader,
     split_by_sample,
-    synthetic_ndjson_lines_two_class,
 )
 from pyhealth.models import EHRMambaCEHR
 from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
@@ -143,6 +142,63 @@ SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
 EPOCHS = 20
+
+
+def _quick_test_ndjson_dir() -> str:
+    """Write two-patient synthetic NDJSON; returns temp directory (caller cleans up)."""
+
+    import json
+
+    tmp = tempfile.mkdtemp(prefix="pyhealth_mimic4_fhir_quick_")
+    # Mirrors ``tests/core/mimic4_fhir_ndjson_fixtures.ndjson_two_class_text`` (no test import).
+    patient = {
+        "resourceType": "Patient",
+        "id": "p-synth-1",
+        "birthDate": "1950-01-01",
+        "gender": "female",
+    }
+    enc = {
+        "resourceType": "Encounter",
+        "id": "e1",
+        "subject": {"reference": "Patient/p-synth-1"},
+        "period": {"start": "2020-06-01T10:00:00Z"},
+        "class": {"code": "IMP"},
+    }
+    cond = {
+        "resourceType": "Condition",
+        "id": "c1",
+        "subject": {"reference": "Patient/p-synth-1"},
+        "encounter": {"reference": "Encounter/e1"},
+        "code": {
+            "coding": [{"system": "http://hl7.org/fhir/sid/icd-10-cm", "code": "I10"}]
+        },
+        "onsetDateTime": "2020-06-01T11:00:00Z",
+    }
+    dead_p = {
+        "resourceType": "Patient",
+        "id": "p-synth-2",
+        "birthDate": "1940-05-05",
+        "deceasedBoolean": True,
+    }
+    dead_enc = {
+        "resourceType": "Encounter",
+        "id": "e-dead",
+        "subject": {"reference": "Patient/p-synth-2"},
+        "period": {"start": "2020-07-01T10:00:00Z"},
+        "class": {"code": "IMP"},
+    }
+    dead_obs = {
+        "resourceType": "Observation",
+        "id": "o-dead",
+        "subject": {"reference": "Patient/p-synth-2"},
+        "encounter": {"reference": "Encounter/e-dead"},
+        "effectiveDateTime": "2020-07-01T12:00:00Z",
+        "code": {"coding": [{"system": "http://loinc.org", "code": "789-0"}]},
+    }
+    rows = [patient, enc, cond, dead_p, dead_enc, dead_obs]
+    body = "\n".join(json.dumps(r) for r in rows) + "\n"
+    Path(tmp, "fixture.ndjson").write_text(body, encoding="utf-8")
+    return tmp
 
 
 def _build_loaders(
@@ -170,17 +226,25 @@ def _build_loaders(
 
 def run_single_train(
     *,
-    lines: List[str],
+    fhir_root: str,
     max_len: int,
     use_mpf: bool,
     hidden_dim: int,
     epochs: int,
     lr: float = 1e-3,
+    glob_pattern: str = "*.ndjson",
+    cache_dir: Optional[str] = None,
 ) -> Dict[str, float]:
     """Train/eval one configuration; returns test metrics (floats)."""
 
     task = MPFClinicalPredictionTask(max_len=max_len, use_mpf=use_mpf)
-    _, _, samples = build_fhir_sample_dataset_from_lines(lines, task)
+    ds = MIMIC4FHIRDataset(
+        root=fhir_root,
+        glob_pattern=glob_pattern,
+        cache_dir=cache_dir,
+        max_patients=500,
+    )
+    samples = ds.gather_samples(task)
     sample_ds, train_l, val_l, test_l, vocab_size = _build_loaders(samples, task)
     model = EHRMambaCEHR(
         dataset=sample_ds,
@@ -211,38 +275,44 @@ def run_ablation_table(*, lr: float = 1e-3) -> None:
         (96, True, 64),
         (96, False, 64),
     ]
-    lines = synthetic_ndjson_lines_two_class()
-    print(
-        "Ablation (synthetic, 1 epoch each): max_len, use_mpf, hidden_dim, lr="
-        f"{lr} -> test roc_auc, pr_auc"
-    )
-    rows = []
-    t0 = time.perf_counter()
-    for max_len, use_mpf, hidden_dim in grid:
-        metrics = run_single_train(
-            lines=lines,
-            max_len=max_len,
-            use_mpf=use_mpf,
-            hidden_dim=hidden_dim,
-            epochs=1,
-            lr=lr,
-        )
-        rows.append((max_len, use_mpf, hidden_dim, metrics))
+    tmp = _quick_test_ndjson_dir()
+    try:
         print(
-            f"  max_len={max_len} mpf={use_mpf} hid={hidden_dim} -> "
-            f"roc_auc={metrics['roc_auc']:.4f} pr_auc={metrics['pr_auc']:.4f}"
+            "Ablation (synthetic, 1 epoch each): max_len, use_mpf, hidden_dim, lr="
+            f"{lr} -> test roc_auc, pr_auc"
         )
-    print("ablation_wall_s:", round(time.perf_counter() - t0, 2))
-    best = max(rows, key=lambda r: r[3]["roc_auc"])
-    print(
-        "best_by_roc_auc:",
-        {
-            "max_len": best[0],
-            "use_mpf": best[1],
-            "hidden_dim": best[2],
-            "metrics": best[3],
-        },
-    )
+        rows = []
+        t0 = time.perf_counter()
+        for max_len, use_mpf, hidden_dim in grid:
+            metrics = run_single_train(
+                fhir_root=tmp,
+                max_len=max_len,
+                use_mpf=use_mpf,
+                hidden_dim=hidden_dim,
+                epochs=1,
+                lr=lr,
+                cache_dir=tmp,
+            )
+            rows.append((max_len, use_mpf, hidden_dim, metrics))
+            print(
+                f"  max_len={max_len} mpf={use_mpf} hid={hidden_dim} -> "
+                f"roc_auc={metrics['roc_auc']:.4f} pr_auc={metrics['pr_auc']:.4f}"
+            )
+        print("ablation_wall_s:", round(time.perf_counter() - t0, 2))
+        best = max(rows, key=lambda r: r[3]["roc_auc"])
+        print(
+            "best_by_roc_auc:",
+            {
+                "max_len": best[0],
+                "use_mpf": best[1],
+                "hidden_dim": best[2],
+                "metrics": best[3],
+            },
+        )
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main() -> None:
@@ -271,9 +341,21 @@ def main() -> None:
     )
 
     if quick:
-        lines = synthetic_ndjson_lines_two_class()
-        _, vocab, samples = build_fhir_sample_dataset_from_lines(lines, task)
-        print("quick-test: synthetic samples", len(samples))
+        tmp = _quick_test_ndjson_dir()
+        try:
+            ds = MIMIC4FHIRDataset(
+                root=tmp,
+                glob_pattern="*.ndjson",
+                cache_dir=tmp,
+                max_patients=500,
+            )
+            samples = ds.gather_samples(task)
+            vocab = ds.vocab
+            print("quick-test: synthetic samples", len(samples))
+        finally:
+            import shutil
+
+            shutil.rmtree(tmp, ignore_errors=True)
     else:
         if not fhir_root or not os.path.isdir(fhir_root):
             raise SystemExit(
