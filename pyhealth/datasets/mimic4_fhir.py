@@ -25,6 +25,7 @@ read by :func:`read_fhir_settings_yaml`. For PhysioNet MIMIC-IV on FHIR, set
 from __future__ import annotations
 
 import gzip
+import itertools
 import hashlib
 import json
 import logging
@@ -853,15 +854,28 @@ class MIMIC4FHIRDataset(BaseDataset):
         # Match :meth:`MPFClinicalPredictionTask.__call__`: specials before clinical.
         ensure_special_tokens(self.vocab)
         clinical_cap = max(0, task.max_len - 2)
-        for py_patient in self.iter_patients():
-            fp = fhir_patient_from_patient(py_patient)
-            build_cehr_sequences(fp, self.vocab, clinical_cap, grow_vocab=True)
+        # Same batching as :func:`_task_transform_fn` — one collect per batch, not
+        # one full scan per patient.
+        batch_size = 128
+        base = self.global_event_df
+        for batch in itertools.batched(self.unique_patient_ids, batch_size):
+            patients = (
+                base.filter(pl.col("patient_id").is_in(batch))
+                .collect(engine="streaming")
+                .partition_by("patient_id", as_dict=True)
+            )
+            for patient_key, patient_df in patients.items():
+                patient_id = patient_key[0]
+                py_patient = Patient(patient_id=patient_id, data_source=patient_df)
+                fp = fhir_patient_from_patient(py_patient)
+                build_cehr_sequences(fp, self.vocab, clinical_cap, grow_vocab=True)
 
     def gather_samples(self, task: Any) -> List[Dict[str, Any]]:
         """Run ``task`` on each :class:`~pyhealth.data.Patient` (tabular path)."""
 
         task.vocab = self.vocab
         task._specials = None
+        task.frozen_vocab = False
         samples: List[Dict[str, Any]] = []
         for p in self.iter_patients():
             samples.extend(task(p))

@@ -174,6 +174,40 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
                     bc = bc.tolist()
                 self.assertEqual(ac, bc)
 
+    def test_gather_samples_resets_frozen_vocab_after_set_task(self) -> None:
+        """Reusing the same task after ``set_task`` must grow a new dataset's vocab."""
+
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            write_two_class_ndjson(Path(tmp_a), name="a.ndjson")
+            write_two_class_ndjson(Path(tmp_b), name="b.ndjson")
+            from pyhealth.tasks.mpf_clinical_prediction import (
+                MPFClinicalPredictionTask,
+            )
+
+            ds_a = MIMIC4FHIRDataset(
+                root=tmp_a, glob_pattern="*.ndjson", cache_dir=tmp_a, num_workers=1
+            )
+            ds_b = MIMIC4FHIRDataset(
+                root=tmp_b, glob_pattern="*.ndjson", cache_dir=tmp_b, num_workers=1
+            )
+            task = MPFClinicalPredictionTask(max_len=48, use_mpf=True)
+            ds_a.set_task(task, num_workers=1)
+            self.assertTrue(task.frozen_vocab)
+
+            ref = sorted(
+                ds_b.gather_samples(MPFClinicalPredictionTask(max_len=48, use_mpf=True)),
+                key=lambda s: s["patient_id"],
+            )
+            got = sorted(ds_b.gather_samples(task), key=lambda s: s["patient_id"])
+            self.assertEqual(len(got), len(ref))
+            for a, b in zip(ref, got):
+                self.assertEqual(a["label"], b["label"])
+                ac = a["concept_ids"]
+                bc = b["concept_ids"]
+                if hasattr(bc, "tolist"):
+                    bc = bc.tolist()
+                self.assertEqual(ac, bc)
+
     def test_encounter_reference_requires_exact_id(self) -> None:
         """``e1`` must not match reference ``Encounter/e10`` (substring bug)."""
 
