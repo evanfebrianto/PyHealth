@@ -8,8 +8,9 @@ token timelines for MPF / EHRMambaCEHR.
 table** as Parquet (``patient_id``, ``timestamp``, ``event_type``,
 ``fhir/resource_json``) under the dataset cache. Ingest **hash-partitions** rows
 by ``patient_id`` into multiple shard files (bounded memory, no full-table sort);
-``global_event_df`` may scan several ``part-*.parquet`` files like other
-multi-part caches. Per-patient time order still comes from
+ingest schedules one process pool task per NDJSON/GZ file (worker count capped by
+``os.cpu_count()``). ``global_event_df`` may scan several ``part-*.parquet`` files
+like other multi-part caches. Per-patient time order still comes from
 :class:`~pyhealth.data.Patient` (``data_source.sort("timestamp")``). The same
 ``global_event_df`` / :class:`~pyhealth.data.Patient` / :meth:`set_task` path
 as CSV-backed datasets applies downstream.
@@ -564,34 +565,28 @@ def _crc32_shard_index(key: str, num_shards: int) -> int:
     return int(u % max(1, num_shards))
 
 
-def _split_paths_for_workers(paths: List[Path], n_workers: int) -> List[List[Path]]:
-    """Partition ``paths`` into ``n_workers`` contiguous slices (roughly balanced)."""
-
-    if n_workers <= 0:
-        return []
-    n = len(paths)
-    if n == 0:
-        return [[] for _ in range(n_workers)]
-    return [paths[(i * n) // n_workers : ((i + 1) * n) // n_workers] for i in range(n_workers)]
-
-
 def _process_fhir_file_chunk(
-    args: Tuple[int, List[Path], Path, int, int],
+    args: Tuple[int, Path, Path, int, int],
 ) -> int:
-    """Read a chunk of NDJSON/NDJSON.GZ files and write hash-sharded Parquet rows.
+    """Read one NDJSON/NDJSON.GZ file and write hash-sharded Parquet rows.
 
-    Output files are named ``shard-{worker_id:04d}-{shard_idx:04d}.parquet`` so
-    workers never write the same path. Multiple flushes for the same shard use one
-    :class:`~pyarrow.parquet.ParquetWriter` (row groups in a single file).
+    Output files are ``shard-{file_idx:04d}-{shard_idx:04d}.parquet`` (``file_idx`` is
+    the file's index in the sorted ingest list) so tasks never share a path. Multiple
+    flushes for the same shard use one :class:`~pyarrow.parquet.ParquetWriter`.
+
+    A single compressed ``.ndjson.gz`` is still consumed sequentially in one process
+    (standard gzip stream); scheduling **one process per input file** lets large
+    files (e.g. Chartevents vs Labevents) run on different CPUs instead of being
+    stuck together in a static path batch.
 
     Args:
-        args: ``(worker_id, file_paths, out_dir, num_shards, batch_size)``.
+        args: ``(file_idx, file_path, out_dir, num_shards, batch_size)``.
 
     Returns:
-        Row count (FHIR resources with a resolvable ``patient_id``) for this worker.
+        Row count (FHIR resources with a resolvable ``patient_id``) for this file.
     """
 
-    worker_id, file_paths, out_dir, num_shards, batch_size = args
+    file_idx, file_path, out_dir, num_shards, batch_size = args
     schema = fhir_events_arrow_schema()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -607,17 +602,15 @@ def _process_fhir_file_chunk(
         table = pa.Table.from_pylist(batches[shard], schema=schema)
         if writers[shard] is None:
             writers[shard] = pq.ParquetWriter(
-                str(out_dir / f"shard-{worker_id:04d}-{shard:04d}.parquet"),
+                str(out_dir / f"shard-{file_idx:04d}-{shard:04d}.parquet"),
                 schema,
             )
         writers[shard].write_table(table)
         n_rows += len(batches[shard])
         batches[shard].clear()
 
-    for fp in file_paths:
-        fp = Path(fp)
-        if not fp.is_file():
-            continue
+    fp = Path(file_path)
+    if fp.is_file():
         for obj in iter_ndjson_file(fp):
             if not isinstance(obj, dict):
                 continue
@@ -649,14 +642,17 @@ def stream_fhir_ndjson_root_to_sharded_parquet(
 ) -> int:
     """Stream matching NDJSON / NDJSON.GZ files into hash-sharded Parquet files.
 
-    Files under ``root`` matching ``glob_pattern`` are read in parallel (one process
-    per chunk). Each process writes ``shard-{worker}-{hash_bucket}.parquet``; the
-    downstream cache globs ``shard-*.parquet`` and scans them with Polars.
+    Files under ``root`` matching ``glob_pattern`` are read in parallel: **one
+    process pool task per file**, up to ``min(os.cpu_count(), N)`` workers, so the
+    pool load-balances across uneven file sizes (MIMIC-IV FHIR has a few very
+    large ``*.ndjson.gz`` shards). Each task writes
+    ``shard-{file_index}-{hash_bucket}.parquet``; the downstream cache globs
+    ``shard-*.parquet`` and scans them with Polars.
 
-    All rows for a given ``patient_id`` share one hash bucket across workers (same
-    ``num_shards``); bucket files from different workers are disjoint paths. Shards
-    with no rows for a worker produce no file. If no input files match, or all
-    rows lack a ``patient_id``, writes a single empty ``shard-0000.parquet``.
+    All rows for a given ``patient_id`` share one hash bucket (same ``num_shards``);
+    output paths are disjoint per input file. Shards with no rows for a file
+    produce no file. If no input files match, or all rows lack a ``patient_id``,
+    writes a single empty ``shard-0000.parquet``.
 
     Returns:
         Number of rows written (FHIR resources with a resolvable ``patient_id``).
@@ -679,32 +675,23 @@ def stream_fhir_ndjson_root_to_sharded_parquet(
 
     cpu = os.cpu_count() or 1
     max_workers = min(cpu, len(all_files))
-    chunks = _split_paths_for_workers(all_files, max_workers)
     work_args = [
-        (i, chunks[i], out_dir, num_shards, batch_size)
-        for i in range(max_workers)
-        if chunks[i]
+        (i, all_files[i], out_dir, num_shards, batch_size)
+        for i in range(len(all_files))
     ]
-
-    if not work_args:
-        pq.write_table(
-            pa.Table.from_pylist([], schema=schema),
-            str(out_dir / "shard-0000.parquet"),
-        )
-        return 0
 
     if len(work_args) == 1:
         n_rows = _process_fhir_file_chunk(work_args[0])
     else:
         with concurrent.futures.ProcessPoolExecutor(
-            max_workers=len(work_args)
+            max_workers=max_workers
         ) as executor:
             counts = list(
                 tqdm(
                     executor.map(_process_fhir_file_chunk, work_args),
                     total=len(work_args),
                     desc="FHIR NDJSON ingest",
-                    unit="chunk",
+                    unit="file",
                 )
             )
         n_rows = sum(counts)
