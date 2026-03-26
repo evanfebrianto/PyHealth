@@ -21,6 +21,16 @@ read by :func:`read_fhir_settings_yaml`. For PhysioNet MIMIC-IV on FHIR, set
 (e.g. ``MimicPatient.ndjson.gz``, ``MimicEncounter.ndjson.gz``); the default
 ``glob_pattern`` is ``**/*.ndjson.gz``. For tests, write small
 ``*.ndjson`` / ``*.ndjson.gz`` files and point ``root`` / ``glob_pattern`` at them.
+
+**JSON / ingest.** NDJSON lines use ``orjson``. Row reading, batching, and Parquet
+shard hashing follow a **fixed implementation** in this module (not configurable on
+:class:`MIMIC4FHIRDataset`). :data:`FHIR_SCHEMA_VERSION` is part of the dataset cache
+fingerprint so ingest or schema changes invalidate cached Parquet.
+
+Plain single-resource lines (not Bundle / ``{"resource":...}`` wrappers) store the
+**original line text** in ``fhir/resource_json`` where safe (skipping
+``orjson.dumps``). Otherwise the resource is serialized with ``orjson.dumps``.
+Column buffers build Arrow tables without per-row ``from_pylist`` dict materialization.
 """
 
 from __future__ import annotations
@@ -29,7 +39,6 @@ import concurrent.futures
 import gzip
 import itertools
 import hashlib
-import json
 import logging
 import multiprocessing
 import os
@@ -42,6 +51,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
+import orjson
 import polars as pl
 from litdata.processing.data_processor import in_notebook
 from tqdm import tqdm
@@ -55,12 +65,28 @@ from .base_dataset import BaseDataset
 # Normalized event table (BaseDataset / Patient contract)
 FHIR_EVENT_TYPE: str = "fhir"
 FHIR_RESOURCE_JSON_COL: str = "fhir/resource_json"
-FHIR_SCHEMA_VERSION: int = 1
+FHIR_SCHEMA_VERSION: int = 2
+
+_FHIR_NDJSON_USE_RAW_LINE: bool = True
+_FHIR_NDJSON_USE_COLUMN_BUFFERS: bool = True
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PAD = 0
 DEFAULT_UNK = 1
+
+
+def _fhir_json_loads_ndjson_line(line: str) -> Any:
+    return orjson.loads(line.encode("utf-8"))
+
+
+def _fhir_json_dumps_resource(res: Dict[str, Any]) -> str:
+    return orjson.dumps(res).decode("utf-8")
+
+
+def _fhir_json_loads_resource_column(raw: str | bytes) -> Any:
+    b = raw.encode("utf-8") if isinstance(raw, str) else raw
+    return orjson.loads(b)
 
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -175,13 +201,13 @@ class ConceptVocab:
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_json(), f)
+        Path(path).write_bytes(
+            orjson.dumps(self.to_json(), option=orjson.OPT_SORT_KEYS)
+        )
 
     @classmethod
     def load(cls, path: str) -> ConceptVocab:
-        with open(path, encoding="utf-8") as f:
-            return cls.from_json(json.load(f))
+        return cls.from_json(orjson.loads(Path(path).read_bytes()))
 
 
 def ensure_special_tokens(vocab: ConceptVocab) -> Dict[str, int]:
@@ -208,11 +234,11 @@ class FHIRPatient:
         return None
 
 
-def parse_ndjson_line(line: str) -> Optional[Dict[str, Any]]:
+def parse_ndjson_line(line: str) -> Any:
     line = line.strip()
     if not line:
         return None
-    return json.loads(line)
+    return _fhir_json_loads_ndjson_line(line)
 
 
 def iter_ndjson_file(path: Path) -> Generator[Dict[str, Any], None, None]:
@@ -225,6 +251,32 @@ def iter_ndjson_file(path: Path) -> Generator[Dict[str, Any], None, None]:
             obj = parse_ndjson_line(line)
             if obj is not None:
                 yield obj
+
+
+def iter_ndjson_raw_line_and_obj(
+    path: Path,
+) -> Generator[Tuple[str, Dict[str, Any]], None, None]:
+    """Yield ``(line_text, parsed_obj)`` for each non-empty NDJSON object line."""
+
+
+    if path.suffix == ".gz":
+        opener = gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    else:
+        opener = open(path, encoding="utf-8", errors="replace")
+    with opener as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            obj: Any = _fhir_json_loads_ndjson_line(raw)
+            if isinstance(obj, dict):
+                yield raw, obj
+
+
+def _ndjson_root_has_top_level_bundle_or_resource_wrapper(obj: Dict[str, Any]) -> bool:
+    """True if root object is a Bundle or a ``{"resource": ...}`` wrapper line."""
+
+    return "entry" in obj or "resource" in obj
 
 
 def _ref_id(ref: Optional[str]) -> Optional[str]:
@@ -259,11 +311,14 @@ def iter_resources_from_ndjson_obj(obj: Dict[str, Any]) -> Iterator[Dict[str, An
             yield r
 
 
-def patient_id_for_resource(res: Dict[str, Any]) -> Optional[str]:
+def patient_id_for_resource(
+    res: Dict[str, Any],
+    resource_type: Optional[str] = None,
+) -> Optional[str]:
     """Logical patient id for sharding and tabular ``patient_id`` (FHIR subject refs)."""
 
     rid: Optional[str] = None
-    rt = res.get("resourceType")
+    rt = resource_type if resource_type is not None else res.get("resourceType")
     if rt == "Patient":
         pid = res.get("id")
         rid = str(pid) if pid is not None else None
@@ -283,8 +338,11 @@ RESOURCE_TYPE_TO_TOKEN_TYPE = {
 }
 
 
-def _event_time(res: Dict[str, Any]) -> Optional[datetime]:
-    rt = res.get("resourceType")
+def _event_time(
+    res: Dict[str, Any],
+    resource_type: Optional[str] = None,
+) -> Optional[datetime]:
+    rt = resource_type if resource_type is not None else res.get("resourceType")
     if rt == "Encounter":
         return _parse_dt((res.get("period") or {}).get("start"))
     if rt == "Condition":
@@ -298,13 +356,17 @@ def _event_time(res: Dict[str, Any]) -> Optional[datetime]:
     return None
 
 
-def resource_row_timestamp(res: Dict[str, Any]) -> Optional[datetime]:
+def resource_row_timestamp(
+    res: Dict[str, Any],
+    resource_type: Optional[str] = None,
+) -> Optional[datetime]:
     """Timestamp for ``Patient.data_source`` sort order and Parquet ``timestamp``."""
 
-    t = _event_time(res)
+    t = _event_time(res, resource_type)
     if t is not None:
         return t
-    if res.get("resourceType") == "Patient":
+    rt = resource_type if resource_type is not None else res.get("resourceType")
+    if rt == "Patient":
         return _parse_dt(res.get("birthDate"))
     return None
 
@@ -531,7 +593,7 @@ def fhir_patient_from_patient(patient: Patient) -> FHIRPatient:
         raw = row.get(FHIR_RESOURCE_JSON_COL)
         if not raw:
             continue
-        resources.append(json.loads(raw))
+        resources.append(_fhir_json_loads_resource_column(raw))
     birth: Optional[datetime] = None
     for r in resources:
         if r.get("resourceType") == "Patient":
@@ -616,11 +678,22 @@ def synthetic_mpf_two_patient_resources() -> List[Dict[str, Any]]:
 
 
 def synthetic_mpf_one_patient_ndjson_text() -> str:
-    return "\n".join(json.dumps(r) for r in synthetic_mpf_one_patient_resources()) + "\n"
+    return (
+        "\n".join(
+            orjson.dumps(r).decode("utf-8") for r in synthetic_mpf_one_patient_resources()
+        )
+        + "\n"
+    )
 
 
 def synthetic_mpf_two_patient_ndjson_text() -> str:
-    return "\n".join(json.dumps(r) for r in synthetic_mpf_two_patient_resources()) + "\n"
+    return (
+        "\n".join(
+            orjson.dumps(r).decode("utf-8")
+            for r in synthetic_mpf_two_patient_resources()
+        )
+        + "\n"
+    )
 
 
 def read_fhir_settings_yaml(path: Optional[str] = None) -> Dict[str, Any]:
@@ -646,9 +719,7 @@ def _fhir_event_dict(patient_id: str, res: Dict[str, Any]) -> Dict[str, Any]:
         "patient_id": patient_id,
         "event_type": FHIR_EVENT_TYPE,
         "timestamp": resource_row_timestamp(res),
-        FHIR_RESOURCE_JSON_COL: json.dumps(
-            res, ensure_ascii=False, separators=(",", ":")
-        ),
+        FHIR_RESOURCE_JSON_COL: _fhir_json_dumps_resource(res),
     }
 
 
@@ -672,8 +743,35 @@ def _crc32_shard_index(key: str, num_shards: int) -> int:
     return int(u % max(1, num_shards))
 
 
+def _normalize_fhir_chunk_work(args: Any) -> Dict[str, Any]:
+    """Pickle-friendly fields for :func:`_process_fhir_file_chunk`."""
+
+    if isinstance(args, dict):
+        w = {**args}
+        w["file_path"] = Path(w["file_path"])
+        w["out_dir"] = Path(w["out_dir"])
+    elif len(args) == 5:
+        file_idx, file_path, out_dir, num_shards, batch_size = args  # type: ignore[misc]
+        w = {
+            "file_idx": file_idx,
+            "file_path": Path(file_path),
+            "out_dir": Path(out_dir),
+            "num_shards": num_shards,
+            "batch_size": batch_size,
+        }
+    else:
+        raise TypeError(
+            "expected a dict or 5-tuple "
+            "(file_idx, file_path, out_dir, num_shards, batch_size) for "
+            f"_process_fhir_file_chunk, got {type(args)!r}"
+        )
+    w["ingest_use_raw_ndjson_line"] = _FHIR_NDJSON_USE_RAW_LINE
+    w["ingest_use_column_buffers"] = _FHIR_NDJSON_USE_COLUMN_BUFFERS
+    return w
+
+
 def _process_fhir_file_chunk(
-    args: Tuple[int, Path, Path, int, int],
+    args: Any,
 ) -> int:
     """Read one NDJSON/NDJSON.GZ file and write hash-sharded Parquet rows.
 
@@ -687,48 +785,110 @@ def _process_fhir_file_chunk(
     stuck together in a static path batch.
 
     Args:
-        args: ``(file_idx, file_path, out_dir, num_shards, batch_size)``.
+        args: A ``dict`` with ``file_idx``, ``file_path``, ``out_dir``,
+            ``num_shards``, and ``batch_size``, or a 5-tuple of those values in that
+            order. Ingest behavior matches :data:`FHIR_SCHEMA_VERSION`.
 
     Returns:
         Row count (FHIR resources with a resolvable ``patient_id``) for this file.
     """
 
-    file_idx, file_path, out_dir, num_shards, batch_size = args
+    wk = _normalize_fhir_chunk_work(args)
+    file_idx = int(wk["file_idx"])
+    fp = wk["file_path"]
+    out_dir = wk["out_dir"]
+    num_shards = max(1, int(wk["num_shards"]))
+    batch_size = int(wk["batch_size"])
+    ingest_use_raw_ndjson_line = bool(wk["ingest_use_raw_ndjson_line"])
+    ingest_use_column_buffers = bool(wk["ingest_use_column_buffers"])
+
     schema = fhir_events_arrow_schema()
-    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    num_shards = max(1, int(num_shards))
-    batches: List[List[Dict[str, Any]]] = [[] for _ in range(num_shards)]
     writers: List[Optional[pq.ParquetWriter]] = [None] * num_shards
     n_rows = 0
 
+    if ingest_use_column_buffers:
+        buf_pid: List[List[str]] = [[] for _ in range(num_shards)]
+        buf_et: List[List[str]] = [[] for _ in range(num_shards)]
+        buf_ts: List[List[Optional[datetime]]] = [[] for _ in range(num_shards)]
+        buf_rj: List[List[str]] = [[] for _ in range(num_shards)]
+    else:
+        batches: List[List[Dict[str, Any]]] = [[] for _ in range(num_shards)]
+
     def flush(shard: int) -> None:
         nonlocal n_rows
-        if not batches[shard]:
-            return
-        table = pa.Table.from_pylist(batches[shard], schema=schema)
+        if ingest_use_column_buffers:
+            if not buf_pid[shard]:
+                return
+            count = len(buf_pid[shard])
+            table = pa.table(
+                {
+                    "patient_id": buf_pid[shard],
+                    "event_type": buf_et[shard],
+                    "timestamp": buf_ts[shard],
+                    FHIR_RESOURCE_JSON_COL: buf_rj[shard],
+                },
+                schema=schema,
+            )
+            buf_pid[shard].clear()
+            buf_et[shard].clear()
+            buf_ts[shard].clear()
+            buf_rj[shard].clear()
+        else:
+            if not batches[shard]:
+                return
+            table = pa.Table.from_pylist(batches[shard], schema=schema)
+            count = len(batches[shard])
+            batches[shard].clear()
         if writers[shard] is None:
             writers[shard] = pq.ParquetWriter(
                 str(out_dir / f"shard-{file_idx:04d}-{shard:04d}.parquet"),
                 schema,
             )
         writers[shard].write_table(table)
-        n_rows += len(batches[shard])
-        batches[shard].clear()
+        n_rows += count
 
-    fp = Path(file_path)
+    def append_row(
+        shard: int, pid: str, ts: Optional[datetime], resource_json: str
+    ) -> None:
+        if ingest_use_column_buffers:
+            buf_pid[shard].append(pid)
+            buf_et[shard].append(FHIR_EVENT_TYPE)
+            buf_ts[shard].append(ts)
+            buf_rj[shard].append(resource_json)
+        else:
+            batches[shard].append(
+                {
+                    "patient_id": pid,
+                    "event_type": FHIR_EVENT_TYPE,
+                    "timestamp": ts,
+                    FHIR_RESOURCE_JSON_COL: resource_json,
+                }
+            )
+
     if fp.is_file():
-        for obj in iter_ndjson_file(fp):
-            if not isinstance(obj, dict):
-                continue
+        for raw_line, obj in iter_ndjson_raw_line_and_obj(fp):
+            use_raw_for_line = ingest_use_raw_ndjson_line and (
+                not _ndjson_root_has_top_level_bundle_or_resource_wrapper(obj)
+            )
             for res in iter_resources_from_ndjson_obj(obj):
-                pid = patient_id_for_resource(res)
+                rt = res.get("resourceType")
+                pid = patient_id_for_resource(res, rt)
                 if not pid:
                     continue
-                s = _crc32_shard_index(pid, num_shards)
-                batches[s].append(_fhir_event_dict(pid, res))
-                if len(batches[s]) >= batch_size:
-                    flush(s)
+                ts = resource_row_timestamp(res, rt)
+                resource_json = (
+                    raw_line if use_raw_for_line else _fhir_json_dumps_resource(res)
+                )
+                shard = _crc32_shard_index(pid, num_shards)
+                append_row(shard, pid, ts, resource_json)
+                cur_len = (
+                    len(buf_pid[shard])
+                    if ingest_use_column_buffers
+                    else len(batches[shard])
+                )
+                if cur_len >= batch_size:
+                    flush(shard)
 
     for s in range(num_shards):
         flush(s)
@@ -783,12 +943,18 @@ def stream_fhir_ndjson_root_to_sharded_parquet(
     cpu = os.cpu_count() or 1
     max_workers = min(cpu, len(all_files))
     work_args = [
-        (i, all_files[i], out_dir, num_shards, batch_size)
+        {
+            "file_idx": i,
+            "file_path": all_files[i],
+            "out_dir": out_dir,
+            "num_shards": num_shards,
+            "batch_size": batch_size,
+        }
         for i in range(len(all_files))
     ]
 
     if len(work_args) == 1:
-        n_rows = _process_fhir_file_chunk(work_args[0])
+        n_rows = _process_fhir_file_chunk(work_args[0])  # type: ignore[arg-type]
     else:
         # ``spawn`` matches :meth:`BaseDataset._task_transform` — avoid ``fork`` with
         # a Polars-import-loaded parent (see Polars multiprocessing docs).
@@ -823,7 +989,9 @@ class MIMIC4FHIRDataset(BaseDataset):
     uses :class:`~pyhealth.data.Patient` and standard :meth:`set_task` like other
     datasets. MPF uses :class:`~pyhealth.tasks.mpf_clinical_prediction.MPFClinicalPredictionTask`.
 
-    Configuration defaults live in ``pyhealth/datasets/configs/mimic4_fhir.yaml``.
+    YAML defaults (e.g. ``glob_pattern``) live in
+    ``pyhealth/datasets/configs/mimic4_fhir.yaml``. NDJSON→Parquet ingest is
+    implemented in this module and is not tunable via the constructor.
 
     Args:
         root: Root directory scanned for NDJSON/NDJSON.GZ (PhysioNet: the ``fhir/``
@@ -904,7 +1072,7 @@ class MIMIC4FHIRDataset(BaseDataset):
             ).hexdigest()[:16]
         except OSError:
             y_digest = "missing"
-        id_str = json.dumps(
+        id_str = orjson.dumps(
             {
                 "root": str(self.root),
                 "tables": sorted(self.tables),
@@ -916,8 +1084,8 @@ class MIMIC4FHIRDataset(BaseDataset):
                 "fhir_schema_version": FHIR_SCHEMA_VERSION,
                 "fhir_yaml_digest16": y_digest,
             },
-            sort_keys=True,
-        )
+            option=orjson.OPT_SORT_KEYS,
+        ).decode("utf-8")
         cid = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_str))
         if cache_dir is None:
             out = Path(platformdirs.user_cache_dir(appname="pyhealth")) / cid
