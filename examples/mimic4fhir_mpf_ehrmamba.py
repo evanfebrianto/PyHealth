@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -265,9 +267,10 @@ def run_ablation_table(*, lr: float = 1e-3) -> None:
                 "metrics": best[3],
             },
         )
-    finally:
-        import shutil
-
+    except Exception:
+        print(f"ablation: leaving scratch directory for debugging: {tmp}", file=sys.stderr)
+        raise
+    else:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -275,6 +278,7 @@ def main() -> None:
     args = _parser.parse_args()
     fhir_root = args.fhir_root or os.environ.get("MIMIC4_FHIR_ROOT")
     quick = args.quick_test
+    quick_test_tmp: Optional[str] = None
     if args.epochs is not None:
         epochs = args.epochs
     else:
@@ -297,21 +301,24 @@ def main() -> None:
     )
 
     if quick:
-        tmp = _quick_test_ndjson_dir()
+        quick_test_tmp = _quick_test_ndjson_dir()
+        ds = MIMIC4FHIRDataset(
+            root=quick_test_tmp,
+            glob_pattern="*.ndjson",
+            cache_dir=quick_test_tmp,
+            max_patients=500,
+        )
         try:
-            ds = MIMIC4FHIRDataset(
-                root=tmp,
-                glob_pattern="*.ndjson",
-                cache_dir=tmp,
-                max_patients=500,
-            )
             samples = ds.gather_samples(task)
-            vocab = ds.vocab
-            print("quick-test: synthetic samples", len(samples))
-        finally:
-            import shutil
-
-            shutil.rmtree(tmp, ignore_errors=True)
+        except Exception:
+            print(
+                f"quick-test: leaving NDJSON/Parquet scratch at {quick_test_tmp}",
+                file=sys.stderr,
+            )
+            raise
+        vocab = ds.vocab
+        del ds
+        print("quick-test: synthetic samples", len(samples))
     else:
         if not fhir_root or not os.path.isdir(fhir_root):
             raise SystemExit(
@@ -329,39 +336,43 @@ def main() -> None:
         vocab = ds.vocab
         print("fhir_root:", fhir_root, "| samples:", len(samples))
 
-    if not samples:
-        raise SystemExit(
-            "No training samples (0 patients or empty sequences). "
-            "PhysioNet MIMIC-IV FHIR uses *.ndjson.gz (default glob **/*.ndjson.gz). "
-            "If your tree is plain *.ndjson, construct MIMIC4FHIRDataset with "
-            "glob_pattern='**/*.ndjson'."
+    try:
+        if not samples:
+            raise SystemExit(
+                "No training samples (0 patients or empty sequences). "
+                "PhysioNet MIMIC-IV FHIR uses *.ndjson.gz (default glob **/*.ndjson.gz). "
+                "If your tree is plain *.ndjson, construct MIMIC4FHIRDataset with "
+                "glob_pattern='**/*.ndjson'."
+            )
+
+        sample_ds, train_loader, val_loader, test_loader, vocab_size = _build_loaders(
+            samples, task
         )
 
-    sample_ds, train_loader, val_loader, test_loader, vocab_size = _build_loaders(
-        samples, task
-    )
+        model = EHRMambaCEHR(
+            dataset=sample_ds,
+            vocab_size=vocab_size,
+            embedding_dim=args.hidden_dim,
+            num_layers=2,
+            dropout=0.1,
+        )
+        trainer = Trainer(model=model, metrics=["roc_auc", "pr_auc"], device=DEVICE)
 
-    model = EHRMambaCEHR(
-        dataset=sample_ds,
-        vocab_size=vocab_size,
-        embedding_dim=args.hidden_dim,
-        num_layers=2,
-        dropout=0.1,
-    )
-    trainer = Trainer(model=model, metrics=["roc_auc", "pr_auc"], device=DEVICE)
-
-    t0 = time.perf_counter()
-    trainer.train(
-        train_dataloader=train_loader,
-        val_dataloader=val_loader,
-        epochs=epochs,
-        monitor="roc_auc",
-        optimizer_params={"lr": args.lr},
-    )
-    results = trainer.evaluate(test_loader)
-    print("Test:", {k: float(v) for k, v in results.items()})
-    print("wall_s:", round(time.perf_counter() - t0, 1))
-    print("concept_vocab_size:", vocab.vocab_size)
+        t0 = time.perf_counter()
+        trainer.train(
+            train_dataloader=train_loader,
+            val_dataloader=val_loader,
+            epochs=epochs,
+            monitor="roc_auc",
+            optimizer_params={"lr": args.lr},
+        )
+        results = trainer.evaluate(test_loader)
+        print("Test:", {k: float(v) for k, v in results.items()})
+        print("wall_s:", round(time.perf_counter() - t0, 1))
+        print("concept_vocab_size:", vocab.vocab_size)
+    finally:
+        if quick_test_tmp is not None:
+            shutil.rmtree(quick_test_tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

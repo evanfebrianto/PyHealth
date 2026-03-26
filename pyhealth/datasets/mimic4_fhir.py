@@ -712,17 +712,6 @@ def read_fhir_settings_yaml(path: Optional[str] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _fhir_event_dict(patient_id: str, res: Dict[str, Any]) -> Dict[str, Any]:
-    """One normalized event row (Python types) for Arrow/Polars."""
-
-    return {
-        "patient_id": patient_id,
-        "event_type": FHIR_EVENT_TYPE,
-        "timestamp": resource_row_timestamp(res),
-        FHIR_RESOURCE_JSON_COL: _fhir_json_dumps_resource(res),
-    }
-
-
 def fhir_events_arrow_schema() -> pa.Schema:
     """Arrow schema for normalized FHIR event rows."""
 
@@ -1201,11 +1190,11 @@ class MIMIC4FHIRDataset(BaseDataset):
             pid_n = len(self.unique_patient_ids)
             effective_workers = min(nw, pid_n) if pid_n else 1
             ensure_special_tokens(self.vocab)
-            if effective_workers > 1:
-                self._warm_mpf_vocabulary(task)
-                task.frozen_vocab = True
-            else:
-                task.frozen_vocab = False
+            # Always warm in the main process: single-worker ``set_task`` can skip
+            # ``BaseDataset._task_transform`` on LitData cache hit, leaving a fresh
+            # vocab at specials-only without this pass.
+            self._warm_mpf_vocabulary(task)
+            task.frozen_vocab = effective_workers > 1
             task.vocab = self.vocab
             task._specials = ensure_special_tokens(self.vocab)
         return super().set_task(

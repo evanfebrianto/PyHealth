@@ -59,6 +59,24 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
             self.assertIsInstance(ds.vocab, ConceptVocab)
             self.assertGreater(ds.vocab.vocab_size, 2)
 
+    def test_set_task_vocab_warm_on_litdata_cache_hit(self) -> None:
+        """MPF ``set_task`` must fill ``ds.vocab`` even when ``_task_transform`` skips."""
+
+        from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp))
+            task_kw = {"max_len": 64, "use_mpf": True}
+            ds1 = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            ds1.set_task(MPFClinicalPredictionTask(**task_kw), num_workers=1)
+            warm_size = ds1.vocab.vocab_size
+            self.assertGreater(
+                warm_size, 6, "fixture plus MPF specials should exceed pad/unk only"
+            )
+            ds2 = MIMIC4FHIRDataset(root=tmp, glob_pattern="*.ndjson", cache_dir=tmp)
+            ds2.set_task(MPFClinicalPredictionTask(**task_kw), num_workers=1)
+            self.assertEqual(ds2.vocab.vocab_size, warm_size)
+
     def test_mortality_heuristic(self) -> None:
         from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
 
