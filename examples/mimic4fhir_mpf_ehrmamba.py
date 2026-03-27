@@ -32,6 +32,18 @@ per-patient timelines from Parquet when building batches; very large cohorts nee
 enough RAM/disk for caches and batching. Restrict ``glob_pattern`` or
 ``max_patients`` when prototyping on a laptop.
 
+**Offline Parquet (NDJSON → Parquet already done):** pass
+``--prebuilt-global-event-dir`` pointing at a directory of ``shard-*.parquet``
+(from ingest / ``stream_fhir_ndjson_root_to_sharded_parquet``). The example seeds
+``global_event_df.parquet/`` under the usual PyHealth cache UUID so
+``BaseDataset.global_event_df`` skips re-ingest — the downstream path is still
+``global_event_df`` → :class:`~pyhealth.data.Patient` →
+:class:`~pyhealth.tasks.mpf_clinical_prediction.MPFClinicalPredictionTask` →
+:class:`~pyhealth.trainer.Trainer``. Use ``--fhir-root`` / ``--glob-pattern`` /
+``--ingest-num-shards`` / ``--max-patients -1`` matching the ingest fingerprint.
+``--train-patient-cap`` limits how many patients are turned into training
+samples (the global unique-patient scan still runs once).
+
 **Approximate minimum specs** (``--quick-test``, CPU, synthetic 2-patient
 fixture; measured once on macOS/arm64 with ``/usr/bin/time -l``): peak RSS
 ~**600–700 MiB**, wall **~10–15 s** for two short epochs. Real NDJSON/GZ at scale
@@ -43,16 +55,27 @@ Usage:
     PYTHONPATH=. python examples/mimic4fhir_mpf_ehrmamba.py --quick-test --ablation
     export MIMIC4_FHIR_ROOT=/path/to/fhir
     pixi run -e base python examples/mimic4fhir_mpf_ehrmamba.py --fhir-root "$MIMIC4_FHIR_ROOT"
+
+    # Prebuilt Parquet shards (skip NDJSON re-ingest); cap patients for a smoke train
+    pixi run -e base python examples/mimic4fhir_mpf_ehrmamba.py \\
+      --prebuilt-global-event-dir /path/to/shard_parquet_dir \\
+      --fhir-root /same/as/ndjson/ingest/root \\
+      --glob-pattern 'Mimic*.ndjson.gz' --ingest-num-shards 16 --max-patients -1 \\
+      --train-patient-cap 2048 --epochs 2 \\
+      --ntfy-url 'https://ntfy.sh/your-topic'
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -121,7 +144,53 @@ _parser.add_argument(
     "--max-patients",
     type=int,
     default=500,
-    help="Cap patients after cache build (sorted ids); lower for smaller runs.",
+    help=(
+        "Fingerprint for cache dir: cap patients during ingest (-1 = full cohort, "
+        "match an uncapped NDJSON→Parquet export)."
+    ),
+)
+_parser.add_argument(
+    "--prebuilt-global-event-dir",
+    type=str,
+    default=None,
+    help=(
+        "Directory with shard-*.parquet from NDJSON ingest. Seeds "
+        "cache/global_event_df.parquet/ so training skips re-ingest (downstream "
+        "unchanged: Patient + MPF + Trainer)."
+    ),
+)
+_parser.add_argument(
+    "--ingest-num-shards",
+    type=int,
+    default=None,
+    help="Fingerprint only: must match NDJSON→Parquet ingest (default: dataset YAML / heuristic).",
+)
+_parser.add_argument(
+    "--train-patient-cap",
+    type=int,
+    default=None,
+    help=(
+        "After cache is ready, only build samples from the first N sorted patient_ids "
+        "(reduces train time; unique-id scan of global_event_df still runs once)."
+    ),
+)
+_parser.add_argument(
+    "--ntfy-url",
+    type=str,
+    default=None,
+    help="POST notification when main() finishes (e.g. https://ntfy.sh/topic).",
+)
+_parser.add_argument(
+    "--loss-plot-path",
+    type=str,
+    default=None,
+    help="Write loss curve PNG here (default: alongside Trainer log under output/).",
+)
+_parser.add_argument(
+    "--cache-dir",
+    type=str,
+    default=None,
+    help="PyHealth dataset cache parent (UUID subdir added by MIMIC4FHIRDataset).",
 )
 _pre_args, _ = _parser.parse_known_args()
 if _pre_args.gpu is not None:
@@ -144,6 +213,111 @@ SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
 EPOCHS = 20
+
+
+def _max_patients_arg(v: int) -> Optional[int]:
+    return None if v is not None and v < 0 else v
+
+
+def _seed_global_event_cache_from_shards(prebuilt_dir: Path, ds: MIMIC4FHIRDataset) -> None:
+    """Link shard-*.parquet into the dataset cache as part-*.parquet (PyHealth layout)."""
+
+    shards = sorted(prebuilt_dir.glob("shard-*.parquet"))
+    if not shards:
+        raise FileNotFoundError(
+            f"No shard-*.parquet under {prebuilt_dir} — use ingest output directory."
+        )
+    ge = ds.cache_dir / "global_event_df.parquet"
+    if ge.exists() and any(ge.glob("*.parquet")):
+        return
+    ge.mkdir(parents=True, exist_ok=True)
+    for i, src in enumerate(shards):
+        dest = ge / f"part-{i:05d}.parquet"
+        if dest.exists():
+            continue
+        try:
+            os.link(src, dest)
+        except OSError:
+            shutil.copy2(src, dest)
+
+
+def gather_samples_capped(
+    ds: MIMIC4FHIRDataset,
+    task: MPFClinicalPredictionTask,
+    train_patient_cap: Optional[int],
+) -> List[Dict[str, Any]]:
+    """Same as :meth:`MIMIC4FHIRDataset.gather_samples`, optional patient cap."""
+
+    task.vocab = ds.vocab
+    task._specials = None
+    task.frozen_vocab = False
+    pids: List[str] = ds.unique_patient_ids
+    if train_patient_cap is not None:
+        pids = pids[: max(0, train_patient_cap)]
+    samples: List[Dict[str, Any]] = []
+    for pid in pids:
+        samples.extend(task(ds.get_patient(pid)))
+    return samples
+
+
+def _parse_train_losses_from_log(log_path: Path) -> List[float]:
+    """Mean training loss per epoch from Trainer file log."""
+
+    if not log_path.is_file():
+        return []
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    losses: List[float] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if "--- Train epoch-" in line and i + 1 < len(lines):
+            m = re.search(r"loss:\s*([0-9.eE+-]+)", lines[i + 1])
+            if m:
+                losses.append(float(m.group(1)))
+    return losses
+
+
+def _write_loss_plot(losses: List[float], out_path: Path) -> None:
+    if not losses:
+        return
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        csv_path = out_path.with_suffix(".csv")
+        csv_path.write_text(
+            "epoch,train_loss_mean\n"
+            + "\n".join(f"{i},{v}" for i, v in enumerate(losses)),
+            encoding="utf-8",
+        )
+        print(
+            "matplotlib not installed; wrote", csv_path, "(pip install matplotlib for PNG)"
+        )
+        return
+    plt.figure(figsize=(6, 3.5))
+    plt.plot(range(len(losses)), losses, marker="o", linewidth=1)
+    plt.xlabel("epoch")
+    plt.ylabel("mean train loss")
+    plt.title("EHRMambaCEHR training loss (MPF)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=120)
+    plt.close()
+    print("loss plot:", out_path)
+
+
+def _ntfy(url: str, title: str, message: str) -> None:
+    try:
+        req = urllib.request.Request(
+            url,
+            data=message.encode("utf-8"),
+            method="POST",
+        )
+        req.add_header("Title", title[:200])
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            if resp.status >= 400:
+                print("ntfy HTTP", resp.status, file=sys.stderr)
+    except urllib.error.URLError as e:
+        print("ntfy failed:", e, file=sys.stderr)
 
 
 def _quick_test_ndjson_dir() -> str:
@@ -192,17 +366,31 @@ def run_single_train(
     lr: float = 1e-3,
     glob_pattern: str = "*.ndjson",
     cache_dir: Optional[str] = None,
+    dataset_max_patients: Optional[int] = 500,
+    ingest_num_shards: Optional[int] = None,
+    prebuilt_global_event_dir: Optional[str] = None,
+    train_patient_cap: Optional[int] = None,
 ) -> Dict[str, float]:
     """Train/eval one configuration; returns test metrics (floats)."""
 
     task = MPFClinicalPredictionTask(max_len=max_len, use_mpf=use_mpf)
-    ds = MIMIC4FHIRDataset(
-        root=fhir_root,
-        glob_pattern=glob_pattern,
-        cache_dir=cache_dir,
-        max_patients=500,
-    )
-    samples = ds.gather_samples(task)
+    ds_kw: Dict[str, Any] = {
+        "root": fhir_root,
+        "glob_pattern": glob_pattern,
+        "cache_dir": cache_dir,
+        "max_patients": dataset_max_patients,
+    }
+    if ingest_num_shards is not None:
+        ds_kw["ingest_num_shards"] = ingest_num_shards
+    ds = MIMIC4FHIRDataset(**ds_kw)
+    if prebuilt_global_event_dir:
+        _seed_global_event_cache_from_shards(
+            Path(prebuilt_global_event_dir).expanduser().resolve(), ds
+        )
+    if train_patient_cap is not None:
+        samples = gather_samples_capped(ds, task, train_patient_cap)
+    else:
+        samples = ds.gather_samples(task)
     sample_ds, train_l, val_l, test_l, vocab_size = _build_loaders(samples, task)
     model = EHRMambaCEHR(
         dataset=sample_ds,
@@ -250,6 +438,7 @@ def run_ablation_table(*, lr: float = 1e-3) -> None:
                 epochs=1,
                 lr=lr,
                 cache_dir=tmp,
+                dataset_max_patients=500,
             )
             rows.append((max_len, use_mpf, hidden_dim, metrics))
             print(
@@ -276,6 +465,30 @@ def run_ablation_table(*, lr: float = 1e-3) -> None:
 
 def main() -> None:
     args = _parser.parse_args()
+    status = "abort"
+    ntfy_detail = ""
+    try:
+        _main_train(args)
+        status = "ok"
+        ntfy_detail = "Training finished successfully."
+    except SystemExit as e:
+        status = "exit"
+        ntfy_detail = f"SystemExit {e.code!r}"
+        raise
+    except Exception as e:
+        status = "error"
+        ntfy_detail = f"{type(e).__name__}: {e}"[:3800]
+        raise
+    finally:
+        if args.ntfy_url and status in ("ok", "error"):
+            _ntfy(
+                args.ntfy_url,
+                "mimic-fhir-train OK" if status == "ok" else "mimic-fhir-train FAIL",
+                ntfy_detail,
+            )
+
+
+def _main_train(args: argparse.Namespace) -> None:
     fhir_root = args.fhir_root or os.environ.get("MIMIC4_FHIR_ROOT")
     quick = args.quick_test
     quick_test_tmp: Optional[str] = None
@@ -309,6 +522,7 @@ def main() -> None:
             max_patients=500,
         )
         try:
+            print("pipeline: synthetic NDJSON → ingest Parquet → Patient → MPF → Trainer")
             samples = ds.gather_samples(task)
         except Exception:
             print(
@@ -320,19 +534,44 @@ def main() -> None:
         del ds
         print("quick-test: synthetic samples", len(samples))
     else:
+        mp = _max_patients_arg(args.max_patients)
         if not fhir_root or not os.path.isdir(fhir_root):
             raise SystemExit(
-                "Set MIMIC4_FHIR_ROOT or pass --fhir-root to a directory of NDJSON files."
+                "Set MIMIC4_FHIR_ROOT or pass --fhir-root to an existing directory "
+                "(NDJSON tree for ingest fingerprint, even when using --prebuilt-global-event-dir)."
             )
-        ds = MIMIC4FHIRDataset(
-            root=fhir_root,
-            max_patients=args.max_patients,
-            glob_pattern=args.glob_pattern,
-        )
-        print("glob_pattern:", ds.glob_pattern)
+        ds_kw: Dict[str, Any] = {
+            "root": fhir_root,
+            "max_patients": mp,
+            "cache_dir": args.cache_dir,
+        }
+        if args.glob_pattern is not None:
+            ds_kw["glob_pattern"] = args.glob_pattern
+        if args.ingest_num_shards is not None:
+            ds_kw["ingest_num_shards"] = args.ingest_num_shards
+        ds = MIMIC4FHIRDataset(**ds_kw)
+        if args.prebuilt_global_event_dir:
+            pb = Path(args.prebuilt_global_event_dir).expanduser().resolve()
+            if not pb.is_dir():
+                raise SystemExit(f"--prebuilt-global-event-dir not a directory: {pb}")
+            print(
+                "pipeline: offline NDJSON→Parquet shards → seed global_event_df cache → "
+                "Patient → MPF → Trainer (no NDJSON re-ingest)"
+            )
+            _seed_global_event_cache_from_shards(pb, ds)
+        else:
+            print(
+                "pipeline: NDJSON root → MIMIC4FHIRDataset ingest → Parquet cache → "
+                "Patient → MPF → Trainer"
+            )
+        print("glob_pattern:", ds.glob_pattern, "| max_patients fingerprint:", mp)
         task.vocab = ds.vocab
         task._specials = None
-        samples = ds.gather_samples(task)
+        if args.train_patient_cap is not None:
+            print("train_patient_cap:", args.train_patient_cap)
+            samples = gather_samples_capped(ds, task, args.train_patient_cap)
+        else:
+            samples = ds.gather_samples(task)
         vocab = ds.vocab
         print("fhir_root:", fhir_root, "| samples:", len(samples))
 
@@ -370,6 +609,20 @@ def main() -> None:
         print("Test:", {k: float(v) for k, v in results.items()})
         print("wall_s:", round(time.perf_counter() - t0, 1))
         print("concept_vocab_size:", vocab.vocab_size)
+
+        log_txt = (
+            Path(trainer.exp_path) / "log.txt" if trainer.exp_path else None
+        )
+        if log_txt and log_txt.is_file():
+            losses = _parse_train_losses_from_log(log_txt)
+            print("train_loss_per_epoch:", losses)
+            plot_path = (
+                Path(args.loss_plot_path)
+                if args.loss_plot_path
+                else Path(trainer.exp_path) / "train_loss.png"
+            )
+            if trainer.exp_path:
+                _write_loss_plot(losses, plot_path)
     finally:
         if quick_test_tmp is not None:
             shutil.rmtree(quick_test_tmp, ignore_errors=True)
