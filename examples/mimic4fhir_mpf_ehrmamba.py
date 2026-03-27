@@ -27,10 +27,13 @@ real FHIR.
     into the PR description.
 
 **Scaling:** :class:`~pyhealth.datasets.MIMIC4FHIRDataset` streams NDJSON to
-hash-sharded Parquet (bounded RAM during ingest). Training still materializes
-per-patient timelines from Parquet when building batches; very large cohorts need
-enough RAM/disk for caches and batching. Restrict ``glob_pattern`` or
-``max_patients`` when prototyping on a laptop.
+hash-sharded Parquet (bounded RAM during ingest). This example trains via
+``dataset.set_task(MPFClinicalPredictionTask)`` → LitData-backed
+:class:`~pyhealth.datasets.sample_dataset.SampleDataset` →
+:class:`~pyhealth.trainer.Trainer` (PyHealth’s standard path), instead of
+materializing all samples with ``gather_samples()``. Prefer ``--max-patients`` to
+ bound ingest when possible. Very large cohorts still need RAM/disk for task
+caches and MPF vocabulary warmup.
 
 **Offline Parquet (NDJSON → Parquet already done):** pass
 ``--prebuilt-global-event-dir`` pointing at a directory of ``shard-*.parquet``
@@ -41,8 +44,9 @@ enough RAM/disk for caches and batching. Restrict ``glob_pattern`` or
 :class:`~pyhealth.tasks.mpf_clinical_prediction.MPFClinicalPredictionTask` →
 :class:`~pyhealth.trainer.Trainer``. Use ``--fhir-root`` / ``--glob-pattern`` /
 ``--ingest-num-shards`` / ``--max-patients -1`` matching the ingest fingerprint.
-``--train-patient-cap`` limits how many patients are turned into training
-samples (the global unique-patient scan still runs once).
+``--train-patient-cap`` restricts task transforms via ``task.pre_filter`` using a
+label-aware deterministic patient subset. The full ``unique_patient_ids`` scan and MPF vocab warmup
+in the dataset still walk the cached cohort.
 
 **Approximate minimum specs** (``--quick-test``, CPU, synthetic 2-patient
 fixture; measured once on macOS/arm64 with ``/usr/bin/time -l``): peak RSS
@@ -69,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import re
 import shutil
 import sys
@@ -170,8 +175,9 @@ _parser.add_argument(
     type=int,
     default=None,
     help=(
-        "After cache is ready, only build samples from the first N sorted patient_ids "
-        "(reduces train time; unique-id scan of global_event_df still runs once)."
+        "After cache is ready, only build samples from a deterministic label-aware "
+        "patient subset of size N (reduces train time; unique-id scan of "
+        "global_event_df still runs once)."
     ),
 )
 _parser.add_argument(
@@ -192,27 +198,53 @@ _parser.add_argument(
     default=None,
     help="PyHealth dataset cache parent (UUID subdir added by MIMIC4FHIRDataset).",
 )
+_parser.add_argument(
+    "--task-num-workers",
+    type=int,
+    default=None,
+    help=(
+        "Workers for LitData task/processor transforms (default: dataset "
+        "``num_workers``, usually 1)."
+    ),
+)
 _pre_args, _ = _parser.parse_known_args()
 if _pre_args.gpu is not None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(_pre_args.gpu)
 
 import torch
 
-from pyhealth.datasets import (
-    MIMIC4FHIRDataset,
-    create_sample_dataset,
-    get_dataloader,
-    split_by_sample,
-)
+import polars as pl
+
+from pyhealth.datasets import MIMIC4FHIRDataset, get_dataloader
+from pyhealth.datasets.mimic4_fhir import fhir_patient_from_patient, infer_mortality_label
 from pyhealth.models import EHRMambaCEHR
 from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
 from pyhealth.trainer import Trainer
+
+
+class PatientCappedMPFTask(MPFClinicalPredictionTask):
+    """Example-only: limit task transform to an explicit patient_id allow-list."""
+
+    def __init__(
+        self,
+        *,
+        max_len: int,
+        use_mpf: bool,
+        patient_ids_allow: List[str],
+    ) -> None:
+        super().__init__(max_len=max_len, use_mpf=use_mpf)
+        self.patient_ids_allow = patient_ids_allow
+
+    def pre_filter(self, df: pl.LazyFrame) -> pl.LazyFrame:
+        return df.filter(pl.col("patient_id").is_in(self.patient_ids_allow))
+
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
 EPOCHS = 20
+SPLIT_RATIOS = (0.7, 0.1, 0.2)
 
 
 def _max_patients_arg(v: int) -> Optional[int]:
@@ -239,25 +271,6 @@ def _seed_global_event_cache_from_shards(prebuilt_dir: Path, ds: MIMIC4FHIRDatas
             os.link(src, dest)
         except OSError:
             shutil.copy2(src, dest)
-
-
-def gather_samples_capped(
-    ds: MIMIC4FHIRDataset,
-    task: MPFClinicalPredictionTask,
-    train_patient_cap: Optional[int],
-) -> List[Dict[str, Any]]:
-    """Same as :meth:`MIMIC4FHIRDataset.gather_samples`, optional patient cap."""
-
-    task.vocab = ds.vocab
-    task._specials = None
-    task.frozen_vocab = False
-    pids: List[str] = ds.unique_patient_ids
-    if train_patient_cap is not None:
-        pids = pids[: max(0, train_patient_cap)]
-    samples: List[Dict[str, Any]] = []
-    for pid in pids:
-        samples.extend(task(ds.get_patient(pid)))
-    return samples
 
 
 def _parse_train_losses_from_log(log_path: Path) -> List[float]:
@@ -333,23 +346,179 @@ def _quick_test_ndjson_dir() -> str:
     return tmp
 
 
-def _build_loaders(
-    samples: List[Dict[str, Any]],
-    task: MPFClinicalPredictionTask,
-) -> tuple[Any, Any, Any, Any, int]:
-    sample_ds = create_sample_dataset(
-        samples=samples,
-        input_schema=task.input_schema,
-        output_schema=task.output_schema,
-        dataset_name="mimic4_fhir_mpf",
+def _patient_label(ds: MIMIC4FHIRDataset, patient_id: str) -> int:
+    patient = ds.get_patient(patient_id)
+    return int(infer_mortality_label(fhir_patient_from_patient(patient)))
+
+
+def _ensure_binary_label_coverage(ds: MIMIC4FHIRDataset) -> None:
+    found: Dict[int, str] = {}
+    scanned = 0
+    for patient_id in ds.unique_patient_ids:
+        label = _patient_label(ds, patient_id)
+        scanned += 1
+        found.setdefault(label, patient_id)
+        if len(found) == 2:
+            print(
+                "label preflight:",
+                {"scanned_patients": scanned, "example_patient_ids": found},
+            )
+            return
+    raise SystemExit(
+        "Binary mortality example found only one label in the available cohort; "
+        "cannot build a valid binary training set from this cache."
     )
-    vocab_size = max(max(s["concept_ids"]) for s in samples) + 1
-    if len(sample_ds) < 8:
-        train_ds = val_ds = test_ds = sample_ds
-    else:
-        train_ds, val_ds, test_ds = split_by_sample(
-            sample_ds, ratios=[0.7, 0.1, 0.2], seed=SEED
+
+
+def _select_patient_ids_for_cap(
+    ds: MIMIC4FHIRDataset, requested_cap: int
+) -> List[str]:
+    patient_ids = ds.unique_patient_ids
+    if not patient_ids:
+        return []
+
+    desired = max(2, requested_cap)
+    desired = min(desired, len(patient_ids))
+    if desired < requested_cap:
+        print(
+            f"train_patient_cap requested {requested_cap}, but only {desired} patients are available."
         )
+    elif requested_cap < 2:
+        print(
+            f"train_patient_cap={requested_cap} is too small for binary labels; using {desired}."
+        )
+
+    encountered: List[str] = []
+    label_by_patient_id: Dict[str, int] = {}
+    first_by_label: Dict[int, str] = {}
+    for patient_id in patient_ids:
+        label = _patient_label(ds, patient_id)
+        encountered.append(patient_id)
+        label_by_patient_id[patient_id] = label
+        first_by_label.setdefault(label, patient_id)
+        if len(encountered) >= desired and len(first_by_label) == 2:
+            break
+
+    if len(first_by_label) < 2:
+        raise SystemExit(
+            "Unable to satisfy --train-patient-cap with both binary labels from the "
+            "available cohort. Use a different cache/export or remove the cap."
+        )
+
+    selected = encountered[:desired]
+    selected_labels = {label_by_patient_id[pid] for pid in selected}
+    if len(selected_labels) == 1:
+        missing_label = 1 - next(iter(selected_labels))
+        replacement = first_by_label[missing_label]
+        for idx in range(len(selected) - 1, -1, -1):
+            if label_by_patient_id[selected[idx]] != missing_label:
+                selected[idx] = replacement
+                break
+
+    counts = {
+        0: sum(1 for pid in selected if label_by_patient_id[pid] == 0),
+        1: sum(1 for pid in selected if label_by_patient_id[pid] == 1),
+    }
+    print(
+        "train_patient_cap selection:",
+        {
+            "requested": requested_cap,
+            "selected": len(selected),
+            "scanned_patients": len(encountered),
+            "label_counts": counts,
+        },
+    )
+    return selected
+
+
+def _sample_label(sample: Dict[str, Any]) -> int:
+    label = sample["label"]
+    if isinstance(label, torch.Tensor):
+        return int(label.reshape(-1)[0].item())
+    return int(label)
+
+
+def _split_counts(n: int) -> List[int]:
+    if n < 3:
+        raise ValueError("Need at least 3 samples for three-way stratified split.")
+    counts = [1, 1, 1]
+    remaining = n - 3
+    raw = [ratio * remaining for ratio in SPLIT_RATIOS]
+    floors = [int(x) for x in raw]
+    for i, floor in enumerate(floors):
+        counts[i] += floor
+    assigned = sum(counts)
+    order = sorted(
+        range(3),
+        key=lambda i: raw[i] - floors[i],
+        reverse=True,
+    )
+    for i in order:
+        if assigned >= n:
+            break
+        counts[i] += 1
+        assigned += 1
+    counts[0] += n - assigned
+    return counts
+
+
+def _split_sample_dataset_for_binary_metrics(sample_ds: Any) -> tuple[Any, Any, Any]:
+    if len(sample_ds) < 8:
+        print("sample count < 8; reusing the full dataset for train/val/test.")
+        return sample_ds, sample_ds, sample_ds
+
+    label_to_indices: Dict[int, List[int]] = {0: [], 1: []}
+    for idx in range(len(sample_ds)):
+        label_to_indices[_sample_label(sample_ds[idx])].append(idx)
+
+    label_counts = {label: len(indices) for label, indices in label_to_indices.items()}
+    min_count = min(label_counts.values())
+    if min_count < 3:
+        print(
+            "label distribution too small for disjoint binary train/val/test splits; "
+            "reusing the full dataset for train/val/test.",
+            label_counts,
+        )
+        return sample_ds, sample_ds, sample_ds
+
+    rng = random.Random(SEED)
+    split_indices: List[List[int]] = [[], [], []]
+    for indices in label_to_indices.values():
+        shuffled = indices[:]
+        rng.shuffle(shuffled)
+        n_train, n_val, n_test = _split_counts(len(shuffled))
+        split_indices[0].extend(shuffled[:n_train])
+        split_indices[1].extend(shuffled[n_train : n_train + n_val])
+        split_indices[2].extend(shuffled[n_train + n_val : n_train + n_val + n_test])
+
+    for indices in split_indices:
+        indices.sort()
+
+    split_counts = []
+    for indices in split_indices:
+        split_counts.append(
+            {
+                0: sum(1 for idx in indices if _sample_label(sample_ds[idx]) == 0),
+                1: sum(1 for idx in indices if _sample_label(sample_ds[idx]) == 1),
+                "n": len(indices),
+            }
+        )
+    print(
+        "binary stratified split counts:",
+        {"train": split_counts[0], "val": split_counts[1], "test": split_counts[2]},
+    )
+    return (
+        sample_ds.subset(split_indices[0]),
+        sample_ds.subset(split_indices[1]),
+        sample_ds.subset(split_indices[2]),
+    )
+
+
+def _build_loaders_from_sample_dataset(
+    sample_ds: Any,
+    vocab_size: int,
+) -> tuple[Any, Any, Any, Any, int]:
+    train_ds, val_ds, test_ds = _split_sample_dataset_for_binary_metrics(sample_ds)
     train_loader = get_dataloader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = get_dataloader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = get_dataloader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
@@ -373,7 +542,6 @@ def run_single_train(
 ) -> Dict[str, float]:
     """Train/eval one configuration; returns test metrics (floats)."""
 
-    task = MPFClinicalPredictionTask(max_len=max_len, use_mpf=use_mpf)
     ds_kw: Dict[str, Any] = {
         "root": fhir_root,
         "glob_pattern": glob_pattern,
@@ -388,10 +556,20 @@ def run_single_train(
             Path(prebuilt_global_event_dir).expanduser().resolve(), ds
         )
     if train_patient_cap is not None:
-        samples = gather_samples_capped(ds, task, train_patient_cap)
+        allow = _select_patient_ids_for_cap(ds, train_patient_cap)
+        task: MPFClinicalPredictionTask = PatientCappedMPFTask(
+            max_len=max_len,
+            use_mpf=use_mpf,
+            patient_ids_allow=allow,
+        )
     else:
-        samples = ds.gather_samples(task)
-    sample_ds, train_l, val_l, test_l, vocab_size = _build_loaders(samples, task)
+        _ensure_binary_label_coverage(ds)
+        task = MPFClinicalPredictionTask(max_len=max_len, use_mpf=use_mpf)
+    sample_ds = ds.set_task(task, num_workers=1)
+    vocab_size = ds.vocab.vocab_size
+    sample_ds, train_l, val_l, test_l, vocab_size = _build_loaders_from_sample_dataset(
+        sample_ds, vocab_size
+    )
     model = EHRMambaCEHR(
         dataset=sample_ds,
         vocab_size=vocab_size,
@@ -508,10 +686,8 @@ def _main_train(args: argparse.Namespace) -> None:
     print("max_len:", args.max_len, "| use_mpf:", not args.no_mpf)
     print("hidden_dim:", args.hidden_dim, "| lr:", args.lr)
 
-    task = MPFClinicalPredictionTask(
-        max_len=args.max_len,
-        use_mpf=not args.no_mpf,
-    )
+    sample_ds: Any
+    vocab: Any
 
     if quick:
         quick_test_tmp = _quick_test_ndjson_dir()
@@ -522,17 +698,30 @@ def _main_train(args: argparse.Namespace) -> None:
             max_patients=500,
         )
         try:
-            print("pipeline: synthetic NDJSON → ingest Parquet → Patient → MPF → Trainer")
-            samples = ds.gather_samples(task)
+            print(
+                "pipeline: synthetic NDJSON → ingest Parquet → set_task → "
+                "SampleDataset → Trainer"
+            )
+            task = MPFClinicalPredictionTask(
+                max_len=args.max_len,
+                use_mpf=not args.no_mpf,
+            )
+            print("set_task (quick-test, num_workers=1)...")
+            t_task0 = time.perf_counter()
+            sample_ds = ds.set_task(task, num_workers=1)
+            print(
+                "set_task done: n_samples=",
+                len(sample_ds),
+                "wall_s=",
+                round(time.perf_counter() - t_task0, 2),
+            )
+            vocab = ds.vocab
         except Exception:
             print(
                 f"quick-test: leaving NDJSON/Parquet scratch at {quick_test_tmp}",
                 file=sys.stderr,
             )
             raise
-        vocab = ds.vocab
-        del ds
-        print("quick-test: synthetic samples", len(samples))
     else:
         mp = _max_patients_arg(args.max_patients)
         if not fhir_root or not os.path.isdir(fhir_root):
@@ -556,27 +745,47 @@ def _main_train(args: argparse.Namespace) -> None:
                 raise SystemExit(f"--prebuilt-global-event-dir not a directory: {pb}")
             print(
                 "pipeline: offline NDJSON→Parquet shards → seed global_event_df cache → "
-                "Patient → MPF → Trainer (no NDJSON re-ingest)"
+                "set_task → SampleDataset → Trainer (no NDJSON re-ingest)"
             )
             _seed_global_event_cache_from_shards(pb, ds)
         else:
             print(
                 "pipeline: NDJSON root → MIMIC4FHIRDataset ingest → Parquet cache → "
-                "Patient → MPF → Trainer"
+                "set_task → SampleDataset → Trainer"
             )
         print("glob_pattern:", ds.glob_pattern, "| max_patients fingerprint:", mp)
-        task.vocab = ds.vocab
-        task._specials = None
         if args.train_patient_cap is not None:
             print("train_patient_cap:", args.train_patient_cap)
-            samples = gather_samples_capped(ds, task, args.train_patient_cap)
+            allow = _select_patient_ids_for_cap(ds, args.train_patient_cap)
+            mpf_task: MPFClinicalPredictionTask = PatientCappedMPFTask(
+                max_len=args.max_len,
+                use_mpf=not args.no_mpf,
+                patient_ids_allow=allow,
+            )
+            print("task patient allow-list size:", len(allow))
         else:
-            samples = ds.gather_samples(task)
+            _ensure_binary_label_coverage(ds)
+            mpf_task = MPFClinicalPredictionTask(
+                max_len=args.max_len,
+                use_mpf=not args.no_mpf,
+            )
+        nw = args.task_num_workers
+        if nw is None:
+            nw = ds.num_workers
+        print(f"set_task (LitData task cache, num_workers={nw})...")
+        t_task0 = time.perf_counter()
+        sample_ds = ds.set_task(mpf_task, num_workers=nw)
+        print(
+            "set_task done: n_samples=",
+            len(sample_ds),
+            "wall_s=",
+            round(time.perf_counter() - t_task0, 2),
+        )
         vocab = ds.vocab
-        print("fhir_root:", fhir_root, "| samples:", len(samples))
+        print("fhir_root:", fhir_root)
 
     try:
-        if not samples:
+        if len(sample_ds) == 0:
             raise SystemExit(
                 "No training samples (0 patients or empty sequences). "
                 "PhysioNet MIMIC-IV FHIR uses *.ndjson.gz (default glob **/*.ndjson.gz). "
@@ -584,8 +793,8 @@ def _main_train(args: argparse.Namespace) -> None:
                 "glob_pattern='**/*.ndjson'."
             )
 
-        sample_ds, train_loader, val_loader, test_loader, vocab_size = _build_loaders(
-            samples, task
+        sample_ds, train_loader, val_loader, test_loader, vocab_size = (
+            _build_loaders_from_sample_dataset(sample_ds, vocab.vocab_size)
         )
 
         model = EHRMambaCEHR(
