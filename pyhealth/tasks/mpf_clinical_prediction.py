@@ -50,10 +50,11 @@ class MPFClinicalPredictionTask(BaseTask):
     :meth:`~pyhealth.datasets.MIMIC4FHIRDataset.set_task` path) or legacy
     :class:`~pyhealth.datasets.mimic4_fhir.FHIRPatient`. For :meth:`set_task`,
     :class:`~pyhealth.datasets.MIMIC4FHIRDataset` reserves specials, warms concept
-    keys in the main process (including when LitData skips ``_task_transform`` on
-    cache hit), and sets :attr:`frozen_vocab` when multiple workers run
-    :meth:`~pyhealth.datasets.BaseDataset._task_transform` so worker processes
-    do not race on :class:`~pyhealth.datasets.mimic4_fhir.ConceptVocab`.
+    keys in the main process over the same patient cohort as
+    :meth:`~pyhealth.tasks.base_task.BaseTask.pre_filter` (including when LitData
+    skips ``_task_transform`` on cache hit), and sets :attr:`frozen_vocab` when
+    multiple workers run :meth:`~pyhealth.datasets.BaseDataset._task_transform` so
+    worker processes do not race on :class:`~pyhealth.datasets.mimic4_fhir.ConceptVocab`.
 
     Attributes:
         max_len: Truncated sequence length (must be >= 2 for boundary tokens).

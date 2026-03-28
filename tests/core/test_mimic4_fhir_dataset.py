@@ -2,7 +2,9 @@ import gzip
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, Dict, List
 
+import orjson
 import polars as pl
 
 from pyhealth.datasets import MIMIC4FHIRDataset
@@ -13,6 +15,7 @@ from pyhealth.datasets.mimic4_fhir import (
     build_cehr_sequences,
     fhir_patient_from_patient,
     infer_mortality_label,
+    synthetic_mpf_two_patient_ndjson_text,
 )
 
 from tests.core.mimic4_fhir_ndjson_fixtures import (
@@ -20,6 +23,45 @@ from tests.core.mimic4_fhir_ndjson_fixtures import (
     write_one_patient_ndjson,
     write_two_class_ndjson,
 )
+
+
+def _third_patient_loinc_resources() -> List[Dict[str, Any]]:
+    """Third synthetic patient with a LOINC code not present on p-synth-1/2."""
+
+    return [
+        {
+            "resourceType": "Patient",
+            "id": "p-synth-3",
+            "birthDate": "1960-01-01",
+        },
+        {
+            "resourceType": "Encounter",
+            "id": "e3",
+            "subject": {"reference": "Patient/p-synth-3"},
+            "period": {"start": "2020-08-01T10:00:00Z"},
+            "class": {"code": "IMP"},
+        },
+        {
+            "resourceType": "Observation",
+            "id": "o3",
+            "subject": {"reference": "Patient/p-synth-3"},
+            "encounter": {"reference": "Encounter/e3"},
+            "effectiveDateTime": "2020-08-01T12:00:00Z",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "999-9"}]},
+        },
+    ]
+
+
+def write_two_class_plus_third_ndjson(directory: Path, *, name: str = "fixture.ndjson") -> Path:
+    """Two-class PhysioNet-style fixture plus an extra patient (LOINC 999-9)."""
+
+    lines = synthetic_mpf_two_patient_ndjson_text().strip().split("\n")
+    lines.extend(
+        orjson.dumps(r).decode("utf-8") for r in _third_patient_loinc_resources()
+    )
+    path = directory / name
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 class TestMIMIC4FHIRDataset(unittest.TestCase):
@@ -242,6 +284,49 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
             task = MPFClinicalPredictionTask(max_len=48, use_mpf=True)
             ds.set_task(task, num_workers=2)
             self.assertTrue(task.frozen_vocab)
+
+    def test_mpf_pre_filter_vocab_warmup_excludes_dropped_patients(self) -> None:
+        """Warmup must not deserialize patients omitted by ``pre_filter``."""
+
+        from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
+
+        class TwoPatientMPFTask(MPFClinicalPredictionTask):
+            def pre_filter(self, df: pl.LazyFrame) -> pl.LazyFrame:
+                return df.filter(pl.col("patient_id").is_in(["p-synth-1", "p-synth-2"]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_plus_third_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(
+                root=tmp, glob_pattern="*.ndjson", cache_dir=tmp, num_workers=1
+            )
+            self.assertEqual(len(ds.unique_patient_ids), 3)
+            task = TwoPatientMPFTask(max_len=48, use_mpf=True)
+            ds.set_task(task, num_workers=1)
+            self.assertNotIn("http://loinc.org|999-9", ds.vocab.token_to_id)
+            self.assertIn("http://loinc.org|789-0", ds.vocab.token_to_id)
+
+    def test_mpf_pre_filter_patient_ids_drive_effective_workers(self) -> None:
+        """``len(_mpf_patient_ids_for_task)`` must match ``_task_transform`` slicing."""
+
+        from pyhealth.tasks.mpf_clinical_prediction import MPFClinicalPredictionTask
+
+        class OnePatientMPFTask(MPFClinicalPredictionTask):
+            def pre_filter(self, df: pl.LazyFrame) -> pl.LazyFrame:
+                return df.filter(pl.col("patient_id") == "p-synth-1")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_two_class_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(
+                root=tmp, glob_pattern="*.ndjson", cache_dir=tmp, num_workers=2
+            )
+            task = OnePatientMPFTask(max_len=48, use_mpf=True)
+            warmup_pids = ds._mpf_patient_ids_for_task(task)
+            self.assertEqual(warmup_pids, ["p-synth-1"])
+            nw = 2
+            pid_n = len(warmup_pids)
+            effective_workers = min(nw, pid_n) if pid_n else 1
+            self.assertEqual(effective_workers, 1)
+            self.assertFalse(effective_workers > 1)
 
     def test_encounter_reference_requires_exact_id(self) -> None:
         """``e1`` must not match reference ``Encounter/e10`` (substring bug)."""

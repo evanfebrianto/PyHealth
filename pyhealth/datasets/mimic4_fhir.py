@@ -1187,13 +1187,16 @@ class MIMIC4FHIRDataset(BaseDataset):
                 if in_notebook()
                 else (num_workers if num_workers is not None else self.num_workers)
             )
-            pid_n = len(self.unique_patient_ids)
+            # Match :meth:`BaseDataset._task_transform`: unique ids after ``pre_filter``,
+            # not the full cached cohort (e.g. task subclasses that cap patients).
+            warmup_pids = self._mpf_patient_ids_for_task(task)
+            pid_n = len(warmup_pids)
             effective_workers = min(nw, pid_n) if pid_n else 1
             ensure_special_tokens(self.vocab)
             # Always warm in the main process: single-worker ``set_task`` can skip
             # ``BaseDataset._task_transform`` on LitData cache hit, leaving a fresh
             # vocab at specials-only without this pass.
-            self._warm_mpf_vocabulary(task)
+            self._warm_mpf_vocabulary(task, warmup_pids)
             task.frozen_vocab = effective_workers > 1
             task.vocab = self.vocab
             task._specials = ensure_special_tokens(self.vocab)
@@ -1204,15 +1207,34 @@ class MIMIC4FHIRDataset(BaseDataset):
             output_processors,
         )
 
-    def _warm_mpf_vocabulary(self, task: Any) -> None:
-        """Main-process vocab keys only (parallel ``set_task`` workers use frozen vocab)."""
+    def _mpf_patient_ids_for_task(self, task: Any) -> List[str]:
+        """Sorted unique patient ids that ``task`` will see (same as ``_task_transform``)."""
+
+        lf_filtered = task.pre_filter(self.global_event_df)
+        return (
+            lf_filtered.select("patient_id")
+            .unique()
+            .collect(engine="streaming")
+            .to_series()
+            .sort()
+            .to_list()
+        )
+
+    def _warm_mpf_vocabulary(self, task: Any, patient_ids: List[str]) -> None:
+        """Main-process vocab keys only (parallel ``set_task`` workers use frozen vocab).
+
+        Args:
+            task: MPF task (uses ``max_len`` for clinical token cap).
+            patient_ids: Cohort to warm (post-``pre_filter``), not necessarily
+                :attr:`unique_patient_ids`.
+        """
 
         clinical_cap = max(0, task.max_len - 2)
         # Same batching as :func:`_task_transform_fn` — one collect per batch, not
         # one full scan per patient.
         batch_size = 128
         base = self.global_event_df
-        for batch in itertools.batched(self.unique_patient_ids, batch_size):
+        for batch in itertools.batched(patient_ids, batch_size):
             patients = (
                 base.filter(pl.col("patient_id").is_in(batch))
                 .collect(engine="streaming")
