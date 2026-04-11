@@ -83,8 +83,20 @@ def transform_table_cfg_to_event_frame(
             timestamp_series,
             format=timestamp_format,
             errors=timestamp_errors,
+            utc=True,
         )
-        df = df.assign(timestamp=timestamp_series.astype("datetime64[ms]"))
+
+        def _timestamp_to_naive_ms(part: pd.Series) -> pd.Series:
+            """ISO strings with ``Z`` yield tz-aware UTC; Dask cache needs naive ``datetime64``."""
+
+            if not isinstance(part, pd.Series):
+                return part
+            if getattr(part.dtype, "tz", None) is not None:
+                part = part.dt.tz_convert("UTC").dt.tz_localize(None)
+            return part.astype("datetime64[ms]")
+
+        timestamp_series = timestamp_series.map_partitions(_timestamp_to_naive_ms)
+        df = df.assign(timestamp=timestamp_series)
     else:
         df = df.assign(timestamp=pd.NaT)
 
@@ -532,6 +544,9 @@ class BaseDataset(ABC):
     def _event_transform(self, output_dir: Path) -> None:
         try:
             df = self.load_data()
+            # Dask ``sort_values`` / parquet export can fail when ``patient_id`` is null;
+            # rows without a patient key cannot enter the global event table anyway.
+            df = df.dropna(subset=["patient_id"])
             with DaskCluster(
                 n_workers=self.num_workers,
                 threads_per_worker=1,
