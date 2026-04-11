@@ -17,11 +17,9 @@ under its cache directory, then loads them through a regular ``tables:`` config 
 
 from __future__ import annotations
 
-import functools
 import gzip
 import hashlib
 import itertools
-import operator
 import os
 import shutil
 import logging
@@ -32,6 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import dask.dataframe as dd
+import narwhals as nw
 import orjson
 import pandas as pd
 import platformdirs
@@ -42,7 +41,7 @@ from litdata.processing.data_processor import in_notebook
 from yaml import safe_load
 
 from ..data import Patient
-from .base_dataset import BaseDataset
+from .base_dataset import BaseDataset, transform_table_cfg_to_event_frame
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +57,9 @@ FHIR_TABLES: List[str] = [
     "medication_request",
     "procedure",
 ]
+
+# Tables that carry ``patient_id`` for cohort discovery when ``patient.parquet`` is absent.
+FHIR_TABLES_FOR_PATIENT_IDS: List[str] = [t for t in FHIR_TABLES if t != "patient"]
 
 FHIR_TABLE_FILE_NAMES: Dict[str, str] = {
     table_name: f"{table_name}.parquet" for table_name in FHIR_TABLES
@@ -556,7 +558,7 @@ def _sorted_patient_ids_from_flat_tables(table_dir: Path) -> List[str]:
 
     frames = [
         pl.scan_parquet(str(table_dir / FHIR_TABLE_FILE_NAMES[table_name])).select("patient_id")
-        for table_name in FHIR_TABLES
+        for table_name in FHIR_TABLES_FOR_PATIENT_IDS
     ]
     return (
         pl.concat(frames)
@@ -928,25 +930,41 @@ class MIMIC4FHIRDataset(BaseDataset):
         if self.prepared_tables_dir.exists():
             shutil.rmtree(self.prepared_tables_dir)
 
-        staging = self.create_tmpdir() / "flattened_fhir_tables"
-        filtered = self.create_tmpdir() / "flattened_fhir_tables_filtered"
-        stream_fhir_ndjson_to_flat_tables(root, self.glob_pattern, staging)
+        try:
+            if self.max_patients is None:
+                staging_root = self.create_tmpdir()
+                staging = staging_root / "flattened_fhir_tables"
+                staging.mkdir(parents=True, exist_ok=True)
+                stream_fhir_ndjson_to_flat_tables(root, self.glob_pattern, staging)
+                shutil.move(str(staging), str(self.prepared_tables_dir))
+                return
 
-        if self.max_patients is None:
-            shutil.move(str(staging), str(self.prepared_tables_dir))
-            return
+            staging_root = self.create_tmpdir()
+            staging = staging_root / "flattened_fhir_tables"
+            staging.mkdir(parents=True, exist_ok=True)
+            stream_fhir_ndjson_to_flat_tables(root, self.glob_pattern, staging)
 
-        patient_ids = _sorted_patient_ids_from_flat_tables(staging)
-        keep_ids = patient_ids[: self.max_patients]
-        filter_flat_tables_by_patient_ids(staging, filtered, keep_ids)
-        shutil.move(str(filtered), str(self.prepared_tables_dir))
+            filtered_root = self.create_tmpdir()
+            filtered = filtered_root / "flattened_fhir_tables_filtered"
+            patient_ids = _sorted_patient_ids_from_flat_tables(staging)
+            keep_ids = patient_ids[: self.max_patients]
+            filter_flat_tables_by_patient_ids(staging, filtered, keep_ids)
+            shutil.move(str(filtered), str(self.prepared_tables_dir))
+        finally:
+            self.clean_tmpdir()
 
     def _event_transform(self, output_dir: Path) -> None:
         self._ensure_prepared_tables()
         super()._event_transform(output_dir)
 
     def load_table(self, table_name: str) -> dd.DataFrame:
-        """Load one flattened parquet table using the standard YAML schema."""
+        """Load one flattened parquet table using the same pipeline as :meth:`BaseDataset.load_table`.
+
+        Reads from ``prepared_tables_dir`` instead of ``root``/CSV. Applies column lowercasing,
+        optional ``preprocess_{table_name}``, YAML ``join`` merges (peer parquet in the flattened
+        directory), then the shared :func:`transform_table_cfg_to_event_frame` helper (timestamps
+        use ``errors=\"coerce\"`` for heterogeneous FHIR strings).
+        """
 
         assert self.config is not None, "Config must be provided to load tables"
         if table_name not in self.config.tables:
@@ -957,46 +975,38 @@ class MIMIC4FHIRDataset(BaseDataset):
         if not path.exists():
             raise FileNotFoundError(f"Flattened table not found: {path}")
 
-        df: dd.DataFrame = dd.read_parquet(
+        logger.info("Scanning FHIR flattened table: %s from %s", table_name, path)
+        df = dd.read_parquet(
             str(path),
             split_row_groups=True,  # type: ignore[arg-type]
             blocksize="64MB",
         ).replace("", pd.NA)
+        df = df.rename(columns=str.lower)
 
-        patient_id_col = table_cfg.patient_id
-        timestamp_col = table_cfg.timestamp
-        timestamp_format = table_cfg.timestamp_format
-        attribute_cols = table_cfg.attributes
+        preprocess_func = getattr(self, f"preprocess_{table_name}", None)
+        if preprocess_func is not None:
+            logger.info("Preprocessing table: %s with %s", table_name, preprocess_func.__name__)
+            df = preprocess_func(nw.from_native(df)).to_native()  # type: ignore[union-attr]
 
-        if timestamp_col:
-            if isinstance(timestamp_col, list):
-                timestamp_series: dd.Series = functools.reduce(
-                    operator.add, (df[col].astype("string") for col in timestamp_col)
-                )
-            else:
-                timestamp_series = df[timestamp_col].astype("string")
-            timestamp_series = dd.to_datetime(
-                timestamp_series,
-                format=timestamp_format,
-                errors="coerce",
-            )
-            df = df.assign(timestamp=timestamp_series.astype("datetime64[ms]"))
-        else:
-            df = df.assign(timestamp=pd.NaT)
+        for join_cfg in table_cfg.join:
+            other_path = self.prepared_tables_dir / Path(join_cfg.file_path).name
+            if not other_path.exists():
+                raise FileNotFoundError(f"Join table not found: {other_path}")
+            logger.info("Joining FHIR table %s with %s", table_name, other_path)
+            join_df = dd.read_parquet(
+                str(other_path),
+                split_row_groups=True,  # type: ignore[arg-type]
+                blocksize="64MB",
+            ).replace("", pd.NA)
+            join_df = join_df.rename(columns=str.lower)
+            join_key = join_cfg.on.lower()
+            columns = [c.lower() for c in join_cfg.columns]
+            how = join_cfg.how
+            df = df.merge(join_df[[join_key] + columns], on=join_key, how=how)
 
-        if patient_id_col:
-            df = df.assign(patient_id=df[patient_id_col].astype("string"))
-        else:
-            df = df.reset_index(drop=True)
-            df = df.assign(patient_id=df.index.astype("string"))
-
-        df = df.assign(event_type=table_name)
-        rename_attr = {attr.lower(): f"{table_name}/{attr}" for attr in attribute_cols}
-        df = df.rename(columns=rename_attr)
-        final_cols = ["patient_id", "event_type", "timestamp"] + [
-            rename_attr[attr.lower()] for attr in attribute_cols
-        ]
-        return df[final_cols]
+        return transform_table_cfg_to_event_frame(
+            df, table_name, table_cfg, timestamp_errors="coerce"
+        )
 
     @property
     def unique_patient_ids(self) -> List[str]:
