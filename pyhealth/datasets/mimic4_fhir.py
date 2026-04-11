@@ -41,7 +41,7 @@ from litdata.processing.data_processor import in_notebook
 from yaml import safe_load
 
 from ..data import Patient
-from .base_dataset import BaseDataset, transform_table_cfg_to_event_frame
+from .base_dataset import BaseDataset
 
 logger = logging.getLogger(__name__)
 
@@ -958,12 +958,18 @@ class MIMIC4FHIRDataset(BaseDataset):
         super()._event_transform(output_dir)
 
     def load_table(self, table_name: str) -> dd.DataFrame:
-        """Load one flattened parquet table using the same pipeline as :meth:`BaseDataset.load_table`.
+        """Load one flattened Parquet table, mirroring BaseDataset.load_table's contract.
 
-        Reads from ``prepared_tables_dir`` instead of ``root``/CSV. Applies column lowercasing,
-        optional ``preprocess_{table_name}``, YAML ``join`` merges (peer parquet in the flattened
-        directory), then the shared :func:`transform_table_cfg_to_event_frame` helper (timestamps
-        use ``errors=\"coerce\"`` for heterogeneous FHIR strings).
+        Differences from the base CSV path that are intentional and FHIR-specific:
+        - Source is a pre-built Parquet file under ``prepared_tables_dir``, not CSV.
+        - Timestamps use ``errors="coerce"`` (FHIR ISO strings include timezone ``Z`` suffix
+          or are partial dates; ``errors="raise"`` would break).
+        - After timestamp parsing, any tz-aware column is stripped to naive UTC
+          (Dask's ``to_parquet`` / ``sort_values`` path cannot handle tz-aware datetimes).
+        - Rows with null ``patient_id`` are dropped before returning so the caller's
+          ``sort_values("patient_id")`` in ``_event_transform`` never sees null keys.
+        Everything else (column lowercasing, preprocess hook, join, attribute renaming)
+        matches BaseDataset.load_table exactly.
         """
 
         assert self.config is not None, "Config must be provided to load tables"
@@ -976,24 +982,30 @@ class MIMIC4FHIRDataset(BaseDataset):
             raise FileNotFoundError(f"Flattened table not found: {path}")
 
         logger.info("Scanning FHIR flattened table: %s from %s", table_name, path)
-        df = dd.read_parquet(
+        df: dd.DataFrame = dd.read_parquet(
             str(path),
             split_row_groups=True,  # type: ignore[arg-type]
             blocksize="64MB",
         ).replace("", pd.NA)
+
+        # Mirror BaseDataset.load_table: lowercase columns before preprocess hook.
         df = df.rename(columns=str.lower)
 
+        # Mirror BaseDataset.load_table: optional preprocess_{table_name} hook.
         preprocess_func = getattr(self, f"preprocess_{table_name}", None)
         if preprocess_func is not None:
-            logger.info("Preprocessing table: %s with %s", table_name, preprocess_func.__name__)
+            logger.info(
+                "Preprocessing FHIR table: %s with %s", table_name, preprocess_func.__name__
+            )
             df = preprocess_func(nw.from_native(df)).to_native()  # type: ignore[union-attr]
 
+        # Mirror BaseDataset.load_table: handle joins (resolved against prepared_tables_dir).
         for join_cfg in table_cfg.join:
             other_path = self.prepared_tables_dir / Path(join_cfg.file_path).name
             if not other_path.exists():
-                raise FileNotFoundError(f"Join table not found: {other_path}")
+                raise FileNotFoundError(f"FHIR join table not found: {other_path}")
             logger.info("Joining FHIR table %s with %s", table_name, other_path)
-            join_df = dd.read_parquet(
+            join_df: dd.DataFrame = dd.read_parquet(
                 str(other_path),
                 split_row_groups=True,  # type: ignore[arg-type]
                 blocksize="64MB",
@@ -1001,12 +1013,58 @@ class MIMIC4FHIRDataset(BaseDataset):
             join_df = join_df.rename(columns=str.lower)
             join_key = join_cfg.on.lower()
             columns = [c.lower() for c in join_cfg.columns]
-            how = join_cfg.how
-            df = df.merge(join_df[[join_key] + columns], on=join_key, how=how)
+            df = df.merge(join_df[[join_key] + columns], on=join_key, how=join_cfg.how)
 
-        return transform_table_cfg_to_event_frame(
-            df, table_name, table_cfg, timestamp_errors="coerce"
-        )
+        patient_id_col = table_cfg.patient_id
+        timestamp_col = table_cfg.timestamp
+        timestamp_format = table_cfg.timestamp_format
+        attribute_cols = table_cfg.attributes
+
+        # Timestamp parsing: coerce rather than raise for FHIR heterogeneous strings.
+        if timestamp_col:
+            if isinstance(timestamp_col, list):
+                timestamp_series: dd.Series = functools.reduce(
+                    operator.add, (df[col].astype("string") for col in timestamp_col)
+                )
+            else:
+                timestamp_series = df[timestamp_col].astype("string")
+
+            # utc=True avoids mixed-offset parse errors; we strip tz after.
+            timestamp_series = dd.to_datetime(
+                timestamp_series,
+                format=timestamp_format,
+                errors="coerce",
+                utc=True,
+            )
+
+            def _strip_tz_to_naive_ms(part: pd.Series) -> pd.Series:
+                if getattr(part.dtype, "tz", None) is not None:
+                    part = part.dt.tz_localize(None)
+                return part.astype("datetime64[ms]")
+
+            timestamp_series = timestamp_series.map_partitions(_strip_tz_to_naive_ms)
+            df = df.assign(timestamp=timestamp_series)
+        else:
+            df = df.assign(timestamp=pd.NaT)
+
+        # Mirror BaseDataset.load_table: patient_id from config column or row index.
+        if patient_id_col:
+            df = df.assign(patient_id=df[patient_id_col].astype("string"))
+        else:
+            df = df.reset_index(drop=True)
+            df = df.assign(patient_id=df.index.astype("string"))
+
+        # Drop rows without a patient key; BaseDataset._event_transform's sort_values
+        # on "patient_id" fails on null keys with Dask's division-calculation logic.
+        df = df.dropna(subset=["patient_id"])
+
+        df = df.assign(event_type=table_name)
+
+        rename_attr = {attr.lower(): f"{table_name}/{attr}" for attr in attribute_cols}
+        df = df.rename(columns=rename_attr)
+        attr_cols = [rename_attr[attr.lower()] for attr in attribute_cols]
+        final_cols = ["patient_id", "event_type", "timestamp"] + attr_cols
+        return df[final_cols]
 
     @property
     def unique_patient_ids(self) -> List[str]:

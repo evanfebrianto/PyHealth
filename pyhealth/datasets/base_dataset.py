@@ -37,7 +37,6 @@ from ..data import Patient
 from ..tasks import BaseTask
 from ..processors.base_processor import FeatureProcessor
 from .configs import load_yaml_config
-from .configs.config import TableConfig
 from .sample_dataset import SampleDataset, SampleBuilder
 from ..utils import set_env
 
@@ -46,73 +45,6 @@ logging.getLogger("distributed").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 # Remove LitData version check to avoid unnecessary warnings
 os.environ["LITDATA_DISABLE_VERSION_CHECK"] = "1"
-
-def transform_table_cfg_to_event_frame(
-    df: dd.DataFrame,
-    table_name: str,
-    table_cfg: TableConfig,
-    *,
-    timestamp_errors: str = "raise",
-) -> dd.DataFrame:
-    """Apply YAML ``TableConfig`` to a Dask frame: timestamp, patient_id, event_type, attributes.
-
-    Shared by :meth:`BaseDataset.load_table` and dataset-specific loaders (e.g. FHIR parquet)
-    so the event-column contract stays in one place.
-
-    Args:
-        df: Input frame whose columns already match ``table_cfg`` (typically lowercased).
-        table_name: Event ``event_type`` value and attribute prefix.
-        table_cfg: Parsed table configuration.
-        timestamp_errors: Passed to :func:`dask.dataframe.to_datetime` (``\"raise\"`` vs ``\"coerce\"``).
-    """
-
-    patient_id_col = table_cfg.patient_id
-    timestamp_col = table_cfg.timestamp
-    timestamp_format = table_cfg.timestamp_format
-    attribute_cols = table_cfg.attributes
-
-    if timestamp_col:
-        if isinstance(timestamp_col, list):
-            timestamp_series: dd.Series = functools.reduce(
-                operator.add, (df[col].astype("string") for col in timestamp_col)
-            )
-        else:
-            timestamp_series = df[timestamp_col].astype("string")
-
-        timestamp_series = dd.to_datetime(
-            timestamp_series,
-            format=timestamp_format,
-            errors=timestamp_errors,
-            utc=True,
-        )
-
-        def _timestamp_to_naive_ms(part: pd.Series) -> pd.Series:
-            """ISO strings with ``Z`` yield tz-aware UTC; Dask cache needs naive ``datetime64``."""
-
-            if not isinstance(part, pd.Series):
-                return part
-            if getattr(part.dtype, "tz", None) is not None:
-                part = part.dt.tz_convert("UTC").dt.tz_localize(None)
-            return part.astype("datetime64[ms]")
-
-        timestamp_series = timestamp_series.map_partitions(_timestamp_to_naive_ms)
-        df = df.assign(timestamp=timestamp_series)
-    else:
-        df = df.assign(timestamp=pd.NaT)
-
-    if patient_id_col:
-        df = df.assign(patient_id=df[patient_id_col].astype("string"))
-    else:
-        df = df.reset_index(drop=True)
-        df = df.assign(patient_id=df.index.astype("string"))
-
-    df = df.assign(event_type=table_name)
-    rename_attr = {attr.lower(): f"{table_name}/{attr}" for attr in attribute_cols}
-    df = df.rename(columns=rename_attr)
-    attr_cols = [rename_attr[attr.lower()] for attr in attribute_cols]
-    final_cols = ["patient_id", "event_type", "timestamp"] + attr_cols
-    return df[final_cols]
-
 
 def is_url(path: str) -> bool:
     """URL detection."""
@@ -544,9 +476,6 @@ class BaseDataset(ABC):
     def _event_transform(self, output_dir: Path) -> None:
         try:
             df = self.load_data()
-            # Dask ``sort_values`` / parquet export can fail when ``patient_id`` is null;
-            # rows without a patient key cannot enter the global event table anyway.
-            df = df.dropna(subset=["patient_id"])
             with DaskCluster(
                 n_workers=self.num_workers,
                 threads_per_worker=1,
@@ -667,9 +596,51 @@ class BaseDataset(ABC):
                 join_df[[join_key] + columns], on=join_key, how=how
             )
 
-        return transform_table_cfg_to_event_frame(
-            df, table_name, table_cfg, timestamp_errors="raise"
-        )
+        patient_id_col = table_cfg.patient_id
+        timestamp_col = table_cfg.timestamp
+        timestamp_format = table_cfg.timestamp_format
+        attribute_cols = table_cfg.attributes
+
+        # Timestamp expression
+        # .astype(str) will convert `pd.NA` to "<NA>", which will raise error in to_datetime
+        #   use .astype("string") instead, which keeps `pd.NA` as is.
+        if timestamp_col:
+            if isinstance(timestamp_col, list):
+                # Concatenate all timestamp parts in order with no separator
+                timestamp_series: dd.Series = functools.reduce(
+                    operator.add, (df[col].astype("string") for col in timestamp_col)
+                )
+            else:
+                timestamp_series: dd.Series = df[timestamp_col].astype("string")
+
+            timestamp_series: dd.Series = dd.to_datetime(
+                timestamp_series,
+                format=timestamp_format,
+                errors="raise",
+            )
+            df: dd.DataFrame = df.assign(
+                timestamp=timestamp_series.astype("datetime64[ms]")
+            )
+        else:
+            df: dd.DataFrame = df.assign(timestamp=pd.NaT)
+
+        # If patient_id_col is None, use row index as patient_id
+        if patient_id_col:
+            df: dd.DataFrame = df.assign(patient_id=df[patient_id_col].astype("string"))
+        else:
+            df: dd.DataFrame = df.reset_index(drop=True)
+            df: dd.DataFrame = df.assign(patient_id=df.index.astype("string"))
+
+        df: dd.DataFrame = df.assign(event_type=table_name)
+
+        rename_attr = {attr.lower(): f"{table_name}/{attr}" for attr in attribute_cols}
+        df: dd.DataFrame = df.rename(columns=rename_attr)
+
+        attr_cols = [rename_attr[attr.lower()] for attr in attribute_cols]
+        final_cols = ["patient_id", "event_type", "timestamp"] + attr_cols
+        event_frame = df[final_cols]
+
+        return event_frame
 
     @property
     def unique_patient_ids(self) -> List[str]:
