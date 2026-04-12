@@ -26,7 +26,7 @@ table-first pipeline instead of reparsing nested JSON per patient downstream.
 a **sorted** ``unique`` over the flattened patient table, filters every
 normalized table to that cohort, and then builds ``global_event_df`` from the
 filtered tables. Ingest still scans all matching NDJSON once unless you also
-narrow ``glob_pattern``.
+override ``glob_patterns`` / ``glob_pattern`` (defaults skip non-flattened PhysioNet shards).
 
 **Downstream memory (still important).** Streaming ingest avoids loading the
 entire NDJSON corpus into RAM at once, but other steps can still be heavy on
@@ -34,7 +34,7 @@ large cohorts: ``global_event_df`` materialization, MPF vocabulary warmup, and
 :meth:`set_task` still walk patients and samples; training needs RAM/VRAM for the
 model and batches. For a **full** PhysioNet tree, plan for **large disk**
 (flattened tables plus event cache), **comfortable system RAM** for Polars/PyArrow
-and task pipelines, and restrict ``glob_pattern`` or ``max_patients`` when
+and task pipelines, and restrict ``glob_patterns`` / ``glob_pattern`` or ``max_patients`` when
 prototyping on a laptop.
 
 **Recommended hardware (informal)**
@@ -48,12 +48,12 @@ NDJSON volume** and the amount of flattened table data produced.
   a recent laptop is sufficient.
 
 * **Laptop-scale real FHIR subset**  
-  A **narrow** ``glob_pattern`` and/or ``max_patients`` in the hundreds keeps
+  A **narrow** ``glob_patterns`` / ``glob_pattern`` and/or ``max_patients`` in the hundreds keeps
   cache and task passes manageable. **≥ 16 GB** system RAM is a practical
   comfort target for Polars + trainer + OS; validate GPU **VRAM** for your
   ``max_len`` and batch size.
 
-* **Full default glob on a complete export**  
+* **Full default globs on a complete export**  
   Favor **workstations or servers** with **fast SSD**, **large disk**, and
   **ample RAM** for downstream steps—not because NDJSON is fully buffered in
   memory during ingest, but because total work and caches still scale with the

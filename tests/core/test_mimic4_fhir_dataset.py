@@ -72,6 +72,42 @@ class TestMIMIC4FHIRDataset(unittest.TestCase):
         v = ConceptVocab.from_json({"token_to_id": {}, "next_id": 50})
         self.assertEqual(v._next_id, 50)
 
+    def test_sorted_ndjson_files_accepts_sequence_and_dedupes(self) -> None:
+        from pyhealth.datasets.mimic4_fhir import sorted_ndjson_files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "MimicPatient.ndjson.gz").write_text("x", encoding="utf-8")
+            (root / "MimicMedication.ndjson.gz").write_text("y", encoding="utf-8")
+            (root / "notes.txt").write_text("z", encoding="utf-8")
+            wide = sorted_ndjson_files(root, "**/*.ndjson.gz")
+            narrow = sorted_ndjson_files(
+                root,
+                ["MimicPatient*.ndjson.gz", "**/MimicPatient*.ndjson.gz"],
+            )
+            self.assertEqual(len(wide), 2)
+            self.assertEqual(len(narrow), 1)
+            self.assertEqual(narrow[0].name, "MimicPatient.ndjson.gz")
+
+    def test_dataset_accepts_glob_patterns_kwarg(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            write_one_patient_ndjson(Path(tmp))
+            ds = MIMIC4FHIRDataset(
+                root=tmp, glob_patterns=["*.ndjson"], cache_dir=tmp
+            )
+            self.assertEqual(ds.glob_patterns, ["*.ndjson"])
+            _ = ds.global_event_df.collect(engine="streaming")
+
+    def test_dataset_rejects_both_glob_kwargs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                MIMIC4FHIRDataset(
+                    root=tmp,
+                    glob_pattern="*.ndjson",
+                    glob_patterns=["*.ndjson"],
+                    cache_dir=tmp,
+                )
+
     def test_disk_fixture_resolves_events_per_patient(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             write_one_patient_ndjson(Path(tmp))

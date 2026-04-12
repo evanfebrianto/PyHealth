@@ -509,12 +509,77 @@ def _flatten_resource_to_table_row(
     return None
 
 
+GlobPatternArg = str | Sequence[str]
+"""Type alias for glob pattern argument: single string or sequence of strings."""
+
+
+def sorted_ndjson_files(root: Path, glob_pattern: GlobPatternArg) -> List[Path]:
+    """Return sorted unique file paths under ``root`` matching glob pattern(s).
+
+    Args:
+        root (Path): Root directory to search under.
+        glob_pattern (GlobPatternArg): Single glob string (e.g., ``"*.ndjson.gz"``)
+            or sequence of glob strings. Patterns are applied to ``root.glob()``;
+            results are deduplicated and sorted lexicographically by string path.
+
+    Returns:
+        List[Path]: Sorted list of matching files. Empty if no matches.
+
+    Example:
+        >>> from pathlib import Path
+        >>> root = Path("/data/fhir")
+        >>> # Single pattern:
+        >>> files = sorted_ndjson_files(root, "**/*.ndjson.gz")
+        >>> # Multiple patterns (deduplicated):
+        >>> files = sorted_ndjson_files(root, [
+        ...     "**/MimicPatient*.ndjson.gz",
+        ...     "**/MimicEncounter*.ndjson.gz",
+        ... ])
+    """
+
+    patterns = [glob_pattern] if isinstance(glob_pattern, str) else list(glob_pattern)
+    files: set[Path] = set()
+    for pat in patterns:
+        files.update(p for p in root.glob(pat) if p.is_file())
+    return sorted(files, key=lambda p: str(p))
+
+
 def stream_fhir_ndjson_to_flat_tables(
     root: Path,
-    glob_pattern: str,
+    glob_pattern: GlobPatternArg,
     out_dir: Path,
 ) -> None:
-    """Stream NDJSON resources into normalized per-resource parquet tables."""
+    """Stream NDJSON resources into normalized per-resource Parquet tables.
+
+    Reads all NDJSON/NDJSON.GZ files matching ``glob_pattern`` under ``root``,
+    parses each line as FHIR JSON, normalizes each resource via
+    ``_flatten_resource_to_table_row``, and writes rows to per-resource-type
+    Parquet tables under ``out_dir``. Resources are skipped if their type
+    is not in ``FHIR_TABLES`` (e.g., Medication, Specimen, Organization).
+
+    Args:
+        root (Path): Root directory containing NDJSON/NDJSON.GZ files.
+        glob_pattern (GlobPatternArg): Single glob string or sequence of glob strings
+            to match NDJSON files. E.g., ``"**/*.ndjson.gz"`` or
+            ``["**/MimicPatient*.ndjson.gz", "**/MimicEncounter*.ndjson.gz"]``.
+        out_dir (Path): Output directory for per-resource-type Parquet tables.
+            Created if absent. Writes:
+            - ``patient.parquet``
+            - ``encounter.parquet``
+            - ``condition.parquet``
+            - ``observation.parquet``
+            - ``medication_request.parquet``
+            - ``procedure.parquet``
+
+    Raises:
+        IOError: If files cannot be read or written.
+
+    Notes:
+        - All matching files are decompressed and fully parsed (no early exit
+          for unsupported resource types).
+        - Rows are buffered in memory (batch size 50k) before writing.
+        - Empty output tables are still created.
+    """
 
     out_dir.mkdir(parents=True, exist_ok=True)
     writers = {
@@ -525,7 +590,7 @@ def stream_fhir_ndjson_to_flat_tables(
         for table_name in FHIR_TABLES
     }
 
-    files = sorted(path for path in root.glob(glob_pattern) if path.is_file())
+    files = sorted_ndjson_files(root, glob_pattern)
     if not files:
         for writer in writers.values():
             writer.close()
@@ -837,13 +902,37 @@ def infer_mortality_label(patient: Patient) -> int:
 
 
 class MIMIC4FHIRDataset(BaseDataset):
-    """MIMIC-IV on FHIR with flattened resource tables and standard task flow."""
+    """MIMIC-IV on FHIR with flattened resource tables and standard task flow.
+
+    This dataset normalizes raw MIMIC-IV FHIR NDJSON/NDJSON.GZ exports into
+    six flattened Parquet tables (Patient, Encounter, Condition, Observation,
+    MedicationRequest, Procedure), then pipelines them through
+    :class:`~pyhealth.datasets.BaseDataset` for standard downstream task
+    processing (global event dataframe, patient iteration, task sampling).
+
+    **Ingest flow (out-of-core):**
+    1. Scan NDJSON files matching ``glob_patterns`` (defaults to six Mimic* families).
+    2. Parse and flatten each FHIR resource into a row in the appropriate table.
+    3. Cache normalized tables as Parquet under ``cache_dir / {uuid} / flattened_tables/``.
+    4. Load and compose tables into ``global_event_df`` via YAML config.
+
+    **Data model:**
+    - Resource types outside ``FHIR_TABLES`` (Medication, Specimen, …) are skipped.
+    - Timestamps are coerced from heterogeneous FHIR ISO 8601 strings (with/without
+      timezone, or date-only). Coercion keeps downstream Polars/Dask pipelines robust.
+    - Concept keys are derived from the first FHIR coding or synthesized from references.
+
+    **Cache fingerprinting:**
+    Cache invalidation includes ``glob_patterns`` and YAML digest, so changes to either
+    create a new independent cache.
+    """
 
     def __init__(
         self,
         root: str,
         config_path: Optional[str] = None,
         glob_pattern: Optional[str] = None,
+        glob_patterns: Optional[Sequence[str]] = None,
         max_patients: Optional[int] = None,
         ingest_num_shards: Optional[int] = None,
         vocab_path: Optional[str] = None,
@@ -851,6 +940,63 @@ class MIMIC4FHIRDataset(BaseDataset):
         num_workers: int = 1,
         dev: bool = False,
     ) -> None:
+        """Initialize a MIMIC-IV FHIR dataset.
+
+        Args:
+            root (str): Path to the NDJSON/NDJSON.GZ export directory.
+            config_path (Optional[str]): Path to a custom YAML config file. Defaults to
+                ``pyhealth/datasets/configs/mimic4_fhir.yaml``.
+            glob_pattern (Optional[str]): Single glob pattern for NDJSON files
+                (e.g., ``"*.ndjson.gz"``). Mutually exclusive with ``glob_patterns``.
+                Overrides YAML setting.
+            glob_patterns (Optional[Sequence[str]]): Multiple glob patterns as a list.
+                Patterns are deduplicated and sorted. Mutually exclusive with ``glob_pattern``.
+                Overrides YAML setting.
+            max_patients (Optional[int]): If set, ingest is limited to the first *N*
+                unique patient IDs (sorted). Ingest still parses all matching NDJSON
+                unless you narrow ``glob_patterns`` / ``glob_pattern``. For faster
+                prototyping on a laptop, combine with narrow globs.
+            ingest_num_shards (Optional[int]): Ignored; retained for API compatibility.
+            vocab_path (Optional[str]): Path to a pre-built ConceptVocab JSON file.
+                If provided and exists, it is loaded; otherwise a new vocab is created.
+            cache_dir (Optional[str | Path]): Cache directory root. Behavior:
+
+                - **None** (default): Auto-generated under ``platformdirs.user_cache_dir()``.
+                - **str** or **Path**: Used as root; a UUID is appended per configuration.
+
+            num_workers (int): Number of worker processes for task sampling. Defaults to 1.
+            dev (bool): Development mode: limits to 1000 patients if ``max_patients`` is None.
+
+        Raises:
+            ValueError: If both ``glob_pattern`` and ``glob_patterns`` are provided.
+            TypeError: If ``glob_patterns`` in YAML is not a list.
+            FileNotFoundError: If ``root`` or ``config_path`` does not exist.
+
+        Notes:
+            - **Glob resolution order:** ``glob_patterns`` kwarg → ``glob_pattern`` kwarg
+              → YAML ``glob_patterns`` → YAML ``glob_pattern`` → ``"**/*.ndjson.gz"`` (fallback).
+            - **Default YAML globs** match only the six MIMIC shard families that map to
+              flattened tables, skipping ~10% of PhysioNet exports (Medication, Specimen, …).
+            - **Cache fingerprinting** includes ``glob_patterns`` and config YAML digest,
+              so changes invalidate the cache.
+
+        Example:
+            >>> from pyhealth.datasets import MIMIC4FHIRDataset
+            >>> # Using default YAML globs (PhysioNet-compatible):
+            >>> ds = MIMIC4FHIRDataset(root="/data/mimic4_fhir")
+            >>> print(ds.glob_patterns)  # Shows: [MimicPatient*, ..., MimicProcedure*]
+            >>> # Using a custom glob for non-standard NDJSON naming:
+            >>> ds = MIMIC4FHIRDataset(
+            ...     root="/data/ndjson",
+            ...     glob_pattern="*.ndjson",
+            ...     max_patients=100,
+            ... )
+            >>> # Using a narrowed set of patterns for faster testing:
+            >>> ds = MIMIC4FHIRDataset(
+            ...     root="/data/mimic4_fhir",
+            ...     glob_patterns=["**/MimicPatient*.ndjson.gz", "**/MimicObservation*.ndjson.gz"],
+            ... )
+        """
         del ingest_num_shards
 
         default_cfg = os.path.join(
@@ -858,10 +1004,28 @@ class MIMIC4FHIRDataset(BaseDataset):
         )
         self._fhir_config_path = str(Path(config_path or default_cfg).resolve())
         self._fhir_settings = read_fhir_settings_yaml(self._fhir_config_path)
+        if glob_pattern is not None and glob_patterns is not None:
+            raise ValueError("Pass at most one of glob_pattern and glob_patterns.")
+        if glob_patterns is not None:
+            self.glob_patterns = list(glob_patterns)
+        elif glob_pattern is not None:
+            self.glob_patterns = [glob_pattern]
+        else:
+            raw_list = self._fhir_settings.get("glob_patterns")
+            if raw_list:
+                if not isinstance(raw_list, list):
+                    raise TypeError(
+                        "mimic4_fhir.yaml glob_patterns must be a list of strings."
+                    )
+                self.glob_patterns = [str(x) for x in raw_list]
+            elif self._fhir_settings.get("glob_pattern") is not None:
+                self.glob_patterns = [str(self._fhir_settings["glob_pattern"])]
+            else:
+                self.glob_patterns = ["**/*.ndjson.gz"]
         self.glob_pattern = (
-            glob_pattern
-            if glob_pattern is not None
-            else str(self._fhir_settings.get("glob_pattern", "**/*.ndjson.gz"))
+            self.glob_patterns[0]
+            if len(self.glob_patterns) == 1
+            else "; ".join(self.glob_patterns)
         )
         self.max_patients = 1000 if dev and max_patients is None else max_patients
         self.source_root = str(Path(root).expanduser().resolve())
@@ -893,7 +1057,7 @@ class MIMIC4FHIRDataset(BaseDataset):
                 "tables": sorted(self.tables),
                 "dataset_name": self.dataset_name,
                 "dev": self.dev,
-                "glob_pattern": self.glob_pattern,
+                "glob_patterns": self.glob_patterns,
                 "max_patients": self.max_patients,
                 "fhir_schema_version": FHIR_SCHEMA_VERSION,
                 "fhir_yaml_digest16": yaml_digest,
@@ -935,14 +1099,14 @@ class MIMIC4FHIRDataset(BaseDataset):
                 staging_root = self.create_tmpdir()
                 staging = staging_root / "flattened_fhir_tables"
                 staging.mkdir(parents=True, exist_ok=True)
-                stream_fhir_ndjson_to_flat_tables(root, self.glob_pattern, staging)
+                stream_fhir_ndjson_to_flat_tables(root, self.glob_patterns, staging)
                 shutil.move(str(staging), str(self.prepared_tables_dir))
                 return
 
             staging_root = self.create_tmpdir()
             staging = staging_root / "flattened_fhir_tables"
             staging.mkdir(parents=True, exist_ok=True)
-            stream_fhir_ndjson_to_flat_tables(root, self.glob_pattern, staging)
+            stream_fhir_ndjson_to_flat_tables(root, self.glob_patterns, staging)
 
             filtered_root = self.create_tmpdir()
             filtered = filtered_root / "flattened_fhir_tables_filtered"

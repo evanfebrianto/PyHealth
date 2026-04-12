@@ -789,9 +789,9 @@ def _main_train(args: argparse.Namespace) -> None:
         if len(sample_ds) == 0:
             raise SystemExit(
                 "No training samples (0 patients or empty sequences). "
-                "PhysioNet MIMIC-IV FHIR uses *.ndjson.gz (default glob **/*.ndjson.gz). "
-                "If your tree is plain *.ndjson, construct MIMIC4FHIRDataset with "
-                "glob_pattern='**/*.ndjson'."
+                "PhysioNet MIMIC-IV FHIR uses *.ndjson.gz (see default glob_patterns in "
+                "pyhealth/datasets/configs/mimic4_fhir.yaml). If your tree is plain *.ndjson, "
+                "construct MIMIC4FHIRDataset with glob_pattern='**/*.ndjson'."
             )
 
         sample_ds, train_loader, val_loader, test_loader, vocab_size = (
