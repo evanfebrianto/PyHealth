@@ -17,12 +17,14 @@ under its cache directory, then loads them through a regular ``tables:`` config 
 
 from __future__ import annotations
 
+import functools
 import gzip
 import hashlib
 import itertools
+import logging
+import operator
 import os
 import shutil
-import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -476,14 +478,14 @@ def _flatten_resource_to_table_row(
             "deceased_datetime": resource.get("deceasedDateTime"),
         }
 
-    encounter_id = str(resource.get("id")) if resource.get("id") is not None else None
+    resource_id = str(resource.get("id")) if resource.get("id") is not None else None
     event_time = _resource_time_string(resource, resource_type)
 
     if resource_type == "Encounter":
         return "encounter", {
             "patient_id": patient_id,
-            "resource_id": encounter_id,
-            "encounter_id": encounter_id,
+            "resource_id": resource_id,
+            "encounter_id": resource_id,
             "event_time": event_time,
             "encounter_class": (resource.get("class") or {}).get("code"),
             "encounter_end": (resource.get("period") or {}).get("end"),
@@ -493,7 +495,7 @@ def _flatten_resource_to_table_row(
     concept_key = _clinical_concept_key(resource)
     row = {
         "patient_id": patient_id,
-        "resource_id": encounter_id,
+        "resource_id": resource_id,
         "encounter_id": linked_encounter_id,
         "event_time": event_time,
         "concept_key": concept_key,
@@ -1134,6 +1136,14 @@ class MIMIC4FHIRDataset(BaseDataset):
           ``sort_values("patient_id")`` in ``_event_transform`` never sees null keys.
         Everything else (column lowercasing, preprocess hook, join, attribute renaming)
         matches BaseDataset.load_table exactly.
+
+        NOTE: This method mirrors BaseDataset.load_table (base_dataset.py).
+        The ONLY deviations are:
+          1. dd.read_parquet() instead of _scan_csv_tsv_gz()
+          2. errors="coerce" + utc=True in dd.to_datetime
+          3. map_partitions(tz_localize(None)) for tz-aware dates
+          4. dropna(subset=["patient_id"])
+        If BaseDataset.load_table changes, audit those 4 points here.
         """
 
         assert self.config is not None, "Config must be provided to load tables"
