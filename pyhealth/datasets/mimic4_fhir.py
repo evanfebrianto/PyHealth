@@ -608,6 +608,7 @@ def stream_fhir_ndjson_to_flat_tables(
           for unsupported resource types).
         - Rows are buffered in memory (batch size 50k) before writing.
         - Empty output tables are still created.
+        - Writers are always closed in a ``finally`` block (including on errors).
     """
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -619,23 +620,22 @@ def stream_fhir_ndjson_to_flat_tables(
         for table_name in FHIR_TABLES
     }
 
-    files = sorted_ndjson_files(root, glob_pattern)
-    if not files:
+    try:
+        files = sorted_ndjson_files(root, glob_pattern)
+        if not files:
+            return
+
+        for file_path in files:
+            for ndjson_obj in iter_ndjson_objects(file_path):
+                for resource in iter_resources_from_ndjson_obj(ndjson_obj):
+                    flattened = _flatten_resource_to_table_row(resource)
+                    if flattened is None:
+                        continue
+                    table_name, row = flattened
+                    writers[table_name].add(row)
+    finally:
         for writer in writers.values():
             writer.close()
-        return
-
-    for file_path in files:
-        for ndjson_obj in iter_ndjson_objects(file_path):
-            for resource in iter_resources_from_ndjson_obj(ndjson_obj):
-                flattened = _flatten_resource_to_table_row(resource)
-                if flattened is None:
-                    continue
-                table_name, row = flattened
-                writers[table_name].add(row)
-
-    for writer in writers.values():
-        writer.close()
 
 
 def _sorted_patient_ids_from_flat_tables(table_dir: Path) -> List[str]:
