@@ -456,6 +456,35 @@ class _BufferedParquetWriter:
         self.writer.close()
 
 
+def _normalize_deceased_boolean_for_storage(value: Any) -> Optional[str]:
+    """Map ``Patient.deceasedBoolean`` to stored ``\"true\"`` / ``\"false\"`` / ``None``.
+
+    FHIR JSON uses real booleans; some exports incorrectly use strings. Python's
+    ``bool(\"false\")`` is ``True``, so we must not coerce unknown values with
+    ``bool()`` or non-living patients can be written as ``deceased_boolean=\"true\"``.
+    """
+    if value is None:
+        return None
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in ("true", "1", "yes", "y", "t"):
+            return "true"
+        if key in ("false", "0", "no", "n", "f", ""):
+            return "false"
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 0:
+            return "false"
+        if value == 1:
+            return "true"
+        return None
+    return None
+
+
 def _flatten_resource_to_table_row(
     resource: Dict[str, Any],
 ) -> Optional[Tuple[str, Dict[str, Optional[str]]]]:
@@ -470,10 +499,8 @@ def _flatten_resource_to_table_row(
             "patient_fhir_id": str(resource.get("id") or patient_id),
             "birth_date": resource.get("birthDate"),
             "gender": resource.get("gender"),
-            "deceased_boolean": (
-                None
-                if resource.get("deceasedBoolean") is None
-                else str(bool(resource.get("deceasedBoolean"))).lower()
+            "deceased_boolean": _normalize_deceased_boolean_for_storage(
+                resource.get("deceasedBoolean")
             ),
             "deceased_datetime": resource.get("deceasedDateTime"),
         }
@@ -658,6 +685,12 @@ def _clean_string(value: Any) -> Optional[str]:
         value = value.strip()
         return value or None
     return str(value)
+
+
+def _deceased_boolean_column_means_dead(value: Any) -> bool:
+    """True only for an explicit affirmative stored flag (not Python truthiness)."""
+    s = _clean_string(value)
+    return s is not None and s.lower() == "true"
 
 
 def _row_datetime(value: Any) -> Optional[datetime]:
@@ -888,8 +921,7 @@ def infer_mortality_label(patient: Patient) -> int:
 
     for row in patient.data_source.iter_rows(named=True):
         if row.get("event_type") == "patient":
-            deceased_boolean = _clean_string(row.get("patient/deceased_boolean"))
-            if deceased_boolean == "true":
+            if _deceased_boolean_column_means_dead(row.get("patient/deceased_boolean")):
                 return 1
             if _clean_string(row.get("patient/deceased_datetime")):
                 return 1

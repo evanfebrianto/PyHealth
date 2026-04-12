@@ -11,6 +11,7 @@ from pyhealth.data import Patient
 from pyhealth.datasets import MIMIC4FHIRDataset
 from pyhealth.datasets.mimic4_fhir import (
     ConceptVocab,
+    _flatten_resource_to_table_row,
     build_cehr_sequences,
     collect_cehr_timeline_events,
     infer_mortality_label,
@@ -59,6 +60,68 @@ def write_two_class_plus_third_ndjson(directory: Path, *, name: str = "fixture.n
 
 def _patient_from_rows(patient_id: str, rows: List[Dict[str, object]]) -> Patient:
     return Patient(patient_id=patient_id, data_source=pl.DataFrame(rows))
+
+
+class TestDeceasedBooleanFlattening(unittest.TestCase):
+    def test_string_false_not_coerced_by_python_bool(self) -> None:
+        """Non-conformant ``\"false\"`` string must not become stored ``\"true\"``."""
+        row = _flatten_resource_to_table_row(
+            {
+                "resourceType": "Patient",
+                "id": "p-str-false",
+                "deceasedBoolean": "false",
+            }
+        )
+        self.assertIsNotNone(row)
+        _table, payload = row
+        self.assertEqual(payload.get("deceased_boolean"), "false")
+
+    def test_string_true_parsed(self) -> None:
+        row = _flatten_resource_to_table_row(
+            {
+                "resourceType": "Patient",
+                "id": "p-str-true",
+                "deceasedBoolean": "true",
+            }
+        )
+        self.assertIsNotNone(row)
+        self.assertEqual(row[1].get("deceased_boolean"), "true")
+
+    def test_json_booleans_unchanged(self) -> None:
+        for raw, expected in ((True, "true"), (False, "false")):
+            with self.subTest(raw=raw):
+                row = _flatten_resource_to_table_row(
+                    {
+                        "resourceType": "Patient",
+                        "id": "p-bool",
+                        "deceasedBoolean": raw,
+                    }
+                )
+                self.assertIsNotNone(row)
+                self.assertEqual(row[1].get("deceased_boolean"), expected)
+
+    def test_unknown_deceased_type_stored_as_none(self) -> None:
+        row = _flatten_resource_to_table_row(
+            {
+                "resourceType": "Patient",
+                "id": "p-garbage",
+                "deceasedBoolean": {"unexpected": "object"},
+            }
+        )
+        self.assertIsNotNone(row)
+        self.assertIsNone(row[1].get("deceased_boolean"))
+
+    def test_infer_mortality_respects_string_false_row(self) -> None:
+        patient = _patient_from_rows(
+            "p1",
+            [
+                {
+                    "event_type": "patient",
+                    "patient/deceased_boolean": "false",
+                },
+            ],
+        )
+        self.assertEqual(infer_mortality_label(patient), 0)
 
 
 class TestMIMIC4FHIRDataset(unittest.TestCase):
