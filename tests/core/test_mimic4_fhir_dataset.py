@@ -117,6 +117,7 @@ class TestDeceasedBooleanFlattening(unittest.TestCase):
             [
                 {
                     "event_type": "patient",
+                    "timestamp": "2020-01-01T00:00:00",
                     "patient/deceased_boolean": "false",
                 },
             ],
